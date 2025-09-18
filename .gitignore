@@ -1,0 +1,27 @@
+cat > .gitignore <<'EOF'
+# Bytecode / cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual envs & notebooks
+.venv/
+.env/
+.ipynb_checkpoints/
+
+# Checkpoints / weights / outputs
+*.pth
+*.pt
+*.ckpt
+simulation/results/
+simulation/new_results/
+simulation/trained_model_simulation/
+simulation/new_trained_model_simulation/
+
+# Data
+data/
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+EOF
