@@ -57,22 +57,12 @@ class MeanScaler(nn.Module):
 
 
 class RNN(nn.Module):
-    """
-    Autoregressive single-node LSTM.
-    Takes [x_i, time_features] for one node as input.
-    """
-    def __init__(self,
-                 time_feat_dim: int,
-                 hidden_size: int = 15,
-                 num_layers: int = 3,
-                 dropout: float = 0.0):
+    def __init__(self, input_size: int, hidden_size: int = 30, num_layers: int = 3, dropout: float = 0.0):
         super().__init__()
-        self.time_feat_dim = time_feat_dim
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-
         self.lstm = nn.LSTM(
-            input_size = 1 + time_feat_dim,
+            input_size=input_size,
             hidden_size=hidden_size,
             num_layers=num_layers,
             dropout=dropout if num_layers > 1 else 0.0,
@@ -81,7 +71,7 @@ class RNN(nn.Module):
 
     def forward(self, x: torch.Tensor, hidden: tuple = None):
         out, (h_n, c_n) = self.lstm(x, hidden)
-        h_top = h_n[-1]  # (batch_size, hidden_size)
+        h_top = h_n[-1]  # (B, H)
         return out, h_top, (h_n, c_n)
 
 
@@ -170,50 +160,61 @@ class CNF(nn.Module):
             return yT[-1], None
 
 
-class SimulatedDataset(Dataset):
+class CancerTrainDataset(Dataset):
     """
-    Clean simulated time series with context/prediction splits.
+    Windows (context_len, pred_len) over one stochastic node N (cancer_volume),
+    with exogenous actions A (chemo/radio) as features.
     """
-    def __init__(self, df, context_length: int, prediction_length: int, device: torch.device, stride: int = 1):
-        self.context_length = context_length
-        self.prediction_length = prediction_length
-        self.device = device
-        self.stride = max(1, stride)
-        if hasattr(df, 'values'):
-            data = torch.tensor(df.values, dtype=torch.float32, device=device)
-        else:
-            data = df.to(device=device, dtype=torch.float32)
-        self.raw = data  # (N, D)
-
-        N = self.raw.size(0)
-        total_len = context_length + prediction_length
-        self.indices = list(range(0, N - total_len + 1, self.stride))
+    def __init__(self, df: pd.DataFrame, context_len=55, pred_len=5):
+        self.df = df.sort_values(["patient_id", "time"]).reset_index(drop=True)
+        self.context_len = context_len
+        self.pred_len    = pred_len
+        self.groups = []
+        for pid, g in self.df.groupby("patient_id", sort=True):
+            g = g.reset_index(drop=True)
+            if len(g) >= context_len + pred_len:
+                self.groups.append((pid, g))
+        self.DA = 4
 
     def __len__(self):
-        return len(self.indices)
+        return len(self.groups)
 
     def __getitem__(self, idx):
-        start = self.indices[idx]
-        mid = start + self.context_length
-        end = mid + self.prediction_length
-        x = self.raw[start:mid]
-        y = self.raw[mid:end]
-        return torch.cat([x, y], dim=0)
+        pid, g = self.groups[idx]
+        ctx_len, pred_len = self.context_len, self.pred_len
+        block = g.iloc[:ctx_len + pred_len].copy()
 
+        # CPU tensors here
+        N    = torch.tensor(block["cancer_volume"].values,      dtype=torch.float32)  # (T,)
+        Capp = torch.tensor(block["chemo_application"].values,  dtype=torch.float32)
+        Rapp = torch.tensor(block["radio_application"].values,  dtype=torch.float32)
+        Cdose= torch.tensor(block["chemo_dosage"].values,       dtype=torch.float32)
+        Rdose= torch.tensor(block["radio_dosage"].values,       dtype=torch.float32)
 
-def topo_sort(parents: Dict[int, List[int]]) -> List[int]:
-    visited = set()
-    order = []
-    def dfs(node):
-        if node in visited:
-            return
-        visited.add(node)
-        for p in parents[node]:
-            dfs(p)
-        order.append(node)
-    for node in parents:
-        dfs(node)
-    return order
+        A = torch.stack([Capp, Rapp, Cdose, Rdose], dim=-1)  # (T, DA)
+
+        # splits
+        N_ctx, N_fut = N[:ctx_len], N[ctx_len:ctx_len+pred_len]
+        A_ctx, A_fut = A[:ctx_len], A[ctx_len:ctx_len+pred_len]
+
+        # scale N using context stats
+        loc   = N_ctx.mean()
+        scale = N_ctx.std().clamp(min=1e-5)
+        N_ctx_n = (N_ctx - loc) / scale
+        N_fut_n = (N_fut - loc) / scale
+
+        ctx_in = torch.cat([N_ctx_n.unsqueeze(-1), A_ctx], dim=-1)  # (55, 1+DA)
+        fut_in = torch.cat([N_fut_n.unsqueeze(-1), A_fut], dim=-1)  # ( 5, 1+DA)
+
+        return {
+            "patient_id": pid,
+            "ctx_in": ctx_in,   # CPU tensors
+            "fut_in": fut_in,
+            "loc": loc.view(1),
+            "scale": scale.view(1),
+            "N_ctx_n": N_ctx_n,
+            "N_fut_n": N_fut_n,
+        }
 
 
 # =========================
@@ -562,51 +563,6 @@ def _plot_interv_cf(
 # Testing
 # =========================
 
-def test_observational(
-    test_ds, rnn_list, cnfs, epoch, parents,
-    context_length, prediction_length, device,
-    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type="cyclic", mode="forecasting"
-):
-    """
-    Observational forecasting rollout with fan charts.
-    """
-    # eval mode
-    for rn in rnn_list: rn.eval()
-    for cnf in cnfs: cnf.eval()
-    order = topo_sort(parents)
-
-    # sample windows
-    random_idxs = torch.randint(0, 1000, (1000,)).tolist()
-    idxs = random_idxs
-
-    D = len(parents)
-    B = len(idxs)
-
-    # batch + scale
-    ctx, fut = _prepare_test_batch(test_ds, idxs, context_length, device)
-    ctx_in, norm_ctx, loc, scale, buf0 = _scale_context(ctx, D, scaler, K)
-
-    # init
-    hidden, h_list, condition_x_last, B_e, TF = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
-
-    # rollout
-    t0 = time.time()
-    samples_arr = _rollout_observational(fut, parents, order, rnn_list, cnfs,
-                                         hidden, h_list, condition_x_last,
-                                         B, B_e, D, TF, num_ens, prediction_length)
-    print(f"Time taken: {time.time() - t0} seconds")
-
-    _, _, _, q5, q10, q25, q50, q75, q90, q95 = quantiles_and_logp(
-        None, samples_arr, device, loc, scale
-    )
-    q_dict = {5:q5.cpu().numpy(), 10:q10.cpu().numpy(), 25:q25.cpu().numpy(), 50:q50.cpu().numpy(), 75:q75.cpu().numpy(), 90:q90.cpu().numpy(), 95:q95.cpu().numpy()}
-    metrics(fut, samples_arr, device, loc, scale, output_dir, mode)
-    
-    # _plot_fan_charts_observational(
-    #     samples_arr, q_dict, ctx, norm_ctx, loc, scale,
-    #     context_length, prediction_length, fut, D, output_dir, idxs, num_ens, mode=mode
-    # )
-
 
 def test_interv_cf(
     test_ds, rnn_list, cnfs, epoch, parents,
@@ -664,331 +620,128 @@ def test_interv_cf(
              context_length, prediction_length, fut, true_future,
              D, output_dir, idxs, inter_set, mode)
 
-def main_test(
-    Type: str,
-    mode: str,                   # "forecasting" | "interventional" | "counterfactual"
-    parents: dict,
-    data_path: str,                          # if None -> uses default template below
-    save_dir: str,                           # if None -> auto from Type/lengths/stride/K/use_parents
-    output_dir: str,                         # if None -> auto from Type/context/pred/K
-    epoch: int,
-    context_length: int = 90,
-    prediction_length: int = 30,
-    stride: int = 1,
-    K: int = 10,
-    hidden_size: int = 15,
-    epoch: int = 50,
-    num_ens: int = 30,
-    use_parents: bool = True,
-    device: torch.device = None,
-):
-    """
-    Runs the full testing pipeline:
-      - loads dataset split
-      - reconstructs models (RNNs + CNFs) and loads checkpoints
-      - dispatches to forecasting or interventional/counterfactual testing
-      - writes plots/metrics to output_dir
 
-    Assumes helper fns/classes in this file are available:
-      SimulatedDataset, MeanScaler, RNN, CNF,
-      test_observational, test_interv_cf, topo_sort, etc.
-    Also assumes quantiles_and_logp, metrics, and simulate_future_* are importable
-    if your test_* functions call them.
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    if data_path is None:
-        data_path = f"simulation/simulated_data/simulated_timeseries_{Type}.csv"
-
-    if save_dir is None:
-        save_dir = (
-            f"simulation/"
-            f"trained_model_simulation/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-        )
-
-    if output_dir is None:
-        output_dir = (
-            f"simulation/results/"
-            f"{Type}_{context_length}_{prediction_length}_last_{K}"
-        )
-    os.makedirs(output_dir, exist_ok=True)
-
-    df = pd.read_csv(data_path)
-    split_idx = int(len(df) * 0.8)
-    test_df  = df.iloc[split_idx:].reset_index(drop=True)
-
-    test_ds  = SimulatedDataset(test_df, context_length, prediction_length, device, stride=stride)
-
-    D  = len(parents)
-    TF = 0
-
-    rnn_list = torch.nn.ModuleList(
-        [RNN(time_feat_dim=TF, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)]
-    )
-    for i, rn in enumerate(rnn_list):
-        pattern = os.path.join(save_dir, f"epoch_{epoch}_rnn_node_{i}.pth")
-        rn.load_state_dict(torch.load(pattern, map_location=device))
-        rn.eval()
-
-    # CNFs
-    cnfs = []
-    for i in range(D):
-        if use_parents:
-            # hidden of this node + (hidden + value) per parent + K lag
-            cond_dim = rnn_list[i].hidden_size + len(parents[i]) * (hidden_size + 1) + K
-        else:
-            cond_dim = rnn_list[i].hidden_size + K
-        cnf = CNF(data_dim=1, cond_dim=cond_dim, hidden_dim=64, num_layers=3).to(device)
-        pattern = os.path.join(save_dir, f"epoch_{epoch}_cnf_node_{i}.pth")
-        cnf.load_state_dict(torch.load(pattern, map_location=device))
-        cnf.eval()
-        cnfs.append(cnf)
-
-    scaler = MeanScaler().to(device)
-
-    # -------------------
-    # run chosen test
-    # -------------------
-    if mode == "forecasting":
-        test_observational(
-            test_ds=test_ds,
-            rnn_list=rnn_list,
-            cnfs=cnfs,
-            epoch=epoch,
-            parents=parents,
-            context_length=context_length,
-            prediction_length=prediction_length,
-            device=device,
-            K=K,
-            output_dir=output_dir,
-            num_ens=num_ens,
-            scaler=scaler,
-            use_parents=use_parents,
-            stride=stride,
-            Type=Type,
-            mode=mode,
-        )
-    elif mode in ("interventional", "counterfactual"):
-        test_interv_cf(
-            test_ds=test_ds,
-            rnn_list=rnn_list,
-            cnfs=cnfs,
-            epoch=epoch,
-            parents=parents,
-            context_length=context_length,
-            prediction_length=prediction_length,
-            device=device,
-            K=K,
-            output_dir=output_dir,
-            num_ens=num_ens,
-            scaler=scaler,
-            use_parents=use_parents,
-            stride=stride,
-            Type=Type,
-            mode=mode,
-        )
-    else:
-        raise ValueError("mode must be 'forecasting', 'interventional', or 'counterfactual'")
-
-    del rnn_list, cnfs
-    gc.collect()
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-# =========================
-# Training (simplified to always-mean-scaled)
-# =========================
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.manual_seed(42)
     np.random.seed(42)
 
-    Type = "balanced_tail_linear_complicated"
-    path = f'simulation/simulated_data/simulated_timeseries_{Type}.csv'
-    df = pd.read_csv(path)
-    split_idx = int(len(df) * 0.8)
-    train_df = df.iloc[:split_idx].reset_index(drop=True)
-    test_df  = df.iloc[split_idx:].reset_index(drop=True)
+    DA = 4                # [chemo_app, radio_app, chemo_dose, radio_dose]
+    K  = 10               # lags of y
+    H  = 15               # hidden size
 
-    context_length    = 90
-    prediction_length = 30
-    stride            = 1
+    df = pd.read_csv("data/cancer_treatment/training_data.csv")\
+       .sort_values(["patient_id","time"]).reset_index(drop=True)
+    needed = {"patient_id","time","cancer_volume","chemo_application","radio_application","chemo_dosage","radio_dosage"}
+    missing = needed - set(df.columns)
+    if missing:
+        raise ValueError(f"CSV is missing columns: {missing}")
 
-    train_ds = SimulatedDataset(train_df, context_length, prediction_length, device, stride=stride)
-    test_ds  = SimulatedDataset(test_df,  context_length, prediction_length, device, stride=stride)
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    test_loader  = DataLoader(test_ds,  batch_size=128, shuffle=False)
-    print(f"Training samples: {len(train_ds)}")
-    print(f"Testing  samples: {len(test_ds)}")
+    train_ds = CancerTrainDataset(df, context_len=55, pred_len=5)
+    print(f"#patients with usable windows: {len(train_ds)}")
 
-    if Type == "cyclic":
-        parents = {0:[], 1:[0], 2:[1]}
-    elif Type == "cyclic_linear_high_dimension":
-        parents = {i: ([] if i == 0 else ([0] if i == 1 else [0, i-1])) for i in range(50)}
-    elif Type == "balanced_tail" or Type.startswith("balanced_tail_linear"):
-        parents = {0: [], 1:[0], 2:[0], 3:[1], 4:[1], 5:[2], 6:[2], 7:[6]}
-    elif Type in ["diamond", "diamond_2", "diamond_3", "diamond_2_square", "diamond_3_non_additive"]:
-        parents = {0: [], 1:[0], 2:[0], 3:[1], 4:[2], 5:[1], 6:[2], 7:[3,5], 8:[4,6], 9:[7,8]}
-    elif Type in ["two_layer_feed_forward", "two_layer_feed_forward_2", "two_layer_feed_forward_nonlinear"] or Type.startswith("two_layer_feed_forward_non_additive"):
-        parents = {0: [], 1:[], 2:[], 3:[0,1,2], 4:[0,1,2], 5:[0,1,2], 6:[0,1,2], 7:[3,4,5,6], 8:[3,4,5,6], 9:[3,4,5,6]}
-
-    use_parents = True
-    D = len(parents)
-    K = 10
-    hidden_size = 15
-    TF = 0  # no explicit time features in data tensors now
-
-    rnn_list = nn.ModuleList([RNN(time_feat_dim=TF, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)])
-    
-    cnfs = []
-    cnf_layers = 3
-    for i in range(D):
-        if use_parents:
-            cond_dim = rnn_list[i].hidden_size + len(parents[i])*hidden_size + len(parents[i]) + K
-        else:
-            cond_dim = rnn_list[i].hidden_size + K
-        cnf = CNF(data_dim=1, cond_dim=cond_dim, hidden_dim=64, num_layers=cnf_layers).to(device)
-        cnfs.append(cnf)
-    
-    scaler = MeanScaler().to(device)
-
-    opt = torch.optim.Adam(
-        [p for rn in rnn_list for p in rn.parameters()] + [p for cnf in cnfs for p in cnf.parameters()],
-        lr=1e-3
+    pin = (device.type == "cuda")
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=128,
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,           # OK now—no CUDA work in workers
+        pin_memory=pin,
+        persistent_workers=True if 4 > 0 else False,
     )
 
-    N_epochs = 30
-    for epoch in range(N_epochs):
-        print(f"Start training epoch {epoch+1}")
-        p_TF = 1
 
-        node_loss_sum   = { i: 0.0 for i in range(D) }
-        node_count      = { i: 0   for i in range(D) }
+    rnn_y = RNN(input_size=1,   hidden_size=H, num_layers=4).to(device)   # outcome RNN
+    rnn_a = RNN(input_size=DA,  hidden_size=H, num_layers=4).to(device)   # actions RNN
+    cnf_y  = CNF(data_dim=1, cond_dim=H + H + K, hidden_dim=64, num_layers=3).to(device)
+    opt = torch.optim.Adam(list(rnn_y.parameters()) + list(rnn_a.parameters()) + list(cnf_y.parameters()), lr=1e-3)
+
+
+    N_epochs = 15
+    scaler = MeanScaler().to(device)
+
+    for epoch in range(N_epochs):
+        rnn_y.train(); rnn_a.train(); cnf_y.train()
         total_loss = 0.0
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
 
-        for X in loop:
-            X = X.to(device)                       # (batch, ctx+pred, D+TF)
-            B = X.size(0)
-            ctx = X[:, :context_length, :]
-            fut = X[:, context_length:, :]
-            raw = fut[..., :D]
+        for batch in loop:
+            # batch tensors
+            ctx_in = batch["ctx_in"].to(device)     # (B,55,1+DA)
+            fut_in = batch["fut_in"].to(device)     # (B, 5,1+DA)
+            B      = ctx_in.size(0)
 
+            # split
+            y_ctx = ctx_in[..., :1]     # (B,55,1)
+            A_ctx = ctx_in[..., 1:]     # (B,55,DA)
+            y_fut = fut_in[..., :1]     # (B, 5,1) -> normalized targets y_{t+1}
+            A_fut = fut_in[..., 1:]     # (B, 5,DA) -> actions driving those futures
+
+            # init optimizer
             opt.zero_grad()
 
-            # always mean-scale
-            ctx_raw  = ctx[..., :D]
-            ctx_time = ctx[..., D:]
-            norm_ctx, loc, scale = scaler(ctx_raw)
+            # 1) run both RNNs over the **context**
+            _, h_y, hid_y = rnn_y(y_ctx)     # h_y: (B,H)
+            _, h_a, hid_a = rnn_a(A_ctx)     # h_a: (B,H)
 
-            raw = (raw - loc) / scale
-            fut = torch.cat([raw, fut[..., D:]], dim=-1)
-            ctx_in = torch.cat([norm_ctx, ctx_time], dim=-1)
-
-            # per-node forward over ctx_in
-            hidden = [None]*D
-            h = []
-            for i, rn in enumerate(rnn_list):
-                inp = torch.cat([ctx_in[..., i:(i+1)], ctx_in[..., D:]], dim=-1)
-                _, h_top, hid = rn(inp, hidden[i])
-                h.append(h_top)
-                hidden[i] = hid
+            # 2) build lag buffer from last K normalized y’s in context
+            if K > 0:
+                lag = y_ctx[:, -K:, :]       # (B,K,1)
+            else:
+                lag = y_ctx[:, :0, :]
 
             loss = 0.0
-            condition_x_last = norm_ctx[:, -K:, :] if K > 0 else norm_ctx[:, :0, :]
 
-            if_pred_nxt = False
-            x_pred_prev = None
+            # 3) iterate over the 5 prediction steps
+            #    Teacher-forcing on y during training (you can add scheduled sampling if you like)
+            hy, ha = h_y, h_a
+            hy_hid, ha_hid = hid_y, hid_a
 
-            for t in range(prediction_length):
-                x_true = raw[:, t:t+1, :]
-                tf_t   = fut[:, t:t+1, D:]
+            for t in range(y_fut.size(1)):   # 0..4
+                x_true = y_fut[:, t, :]     # (B,1)   # y_{t+1}^{norm}
+                A_prev = A_fut[:, t, :]     # (B,DA)  # actions applied to produce x_true
 
-                if_pred_curr = if_pred_nxt
-                if_pred_nxt = (torch.rand(1).item() > p_TF)
+                # CNF condition: [h_y_t, h_a_t, lag_y_K]
+                cond = torch.cat([hy, ha, lag.squeeze(-1)], dim=1)  # (B, H+H+K)
 
-                step_in_rnn = torch.cat([x_pred_prev.unsqueeze(1), tf_t], dim=2) if if_pred_curr else fut[:, t:t+1, :]
+                # flow-matching reference
+                s   = torch.rand(B, 1, device=device)
+                z   = torch.randn(B, 1, device=device)
+                x_s = (1 - s) * x_true + s * z
 
-                h_curr = h_next if t > 0 else h
-                h_next = []
-                for i, rn in enumerate(rnn_list):
-                    inp = torch.cat([step_in_rnn[..., i:(i+1)], step_in_rnn[..., D:]], dim=-1)
-                    _, h_i, hid_i = rn(inp, hidden[i])
-                    h_next.append(h_i)
-                    hidden[i] = hid_i
+                v_pred = cnf_y.forward(s, torch.cat([x_s, cond], dim=1))
+                v_true = z - x_true
+                loss  += F.mse_loss(v_pred, v_true)
 
-                for i in range(D):
-                    x_i = x_true[:, 0, i].unsqueeze(1)
-                    if use_parents:
-                        x_parents_hidden_list = [h_next[j] for j in parents[i]]
-                        x_parents_list = condition_x_last[:, -1, parents[i]]
-                        if K > 0:
-                            cond = torch.cat([h_curr[i], condition_x_last[:,:,i], x_parents_list] + x_parents_hidden_list, dim=1)
-                        else:
-                            cond = torch.cat([h_curr[i], x_parents_list] + x_parents_hidden_list, dim=1)
-                    else:
-                        cond = torch.cat([h_curr[i], condition_x_last[:,:,i]], dim=1) if K > 0 else torch.cat([h_curr[i]], dim=1)
+                # advance both RNNs one step **with teacher forcing** (y_true, A_prev)
+                # y-RNN step
+                y_step_in = x_true.unsqueeze(1)         # (B,1,1)
+                _, hy_new, hy_hid = rnn_y(y_step_in, hy_hid)
+                hy = hy_new
 
-                    s   = torch.rand(B, 1, device=device)
-                    z   = torch.randn(B, 1, device=device)
-                    x_s = (1 - s) * x_i + s * z
+                # action-RNN step
+                A_step_in = A_prev.unsqueeze(1)         # (B,1,DA)
+                _, ha_new, ha_hid = rnn_a(A_step_in, ha_hid)
+                ha = ha_new
 
-                    inp_state = torch.cat([x_s, cond], dim=1)
-                    v_pred    = cnfs[i].forward(s, inp_state)
-                    v_true = z - x_i
-                    this_loss = F.mse_loss(v_pred, v_true)
-                    loss  += this_loss
-                    node_loss_sum[i] += this_loss.item()
-                    node_count[i] += 1
-
-                if if_pred_nxt:
-                    x_pred_dict = {}
-                    for i in range(D):
-                        lag_i    = condition_x_last[:, :, i]
-                        cond_i   = torch.cat([h_curr[i], lag_i], dim=1)
-                        x_pred_i, _ = cnfs[i].sample(cond_i, num_steps=10)
-                        x_pred_dict[i] = x_pred_i
-                    x_pred_prev = torch.cat([x_pred_dict[i] for i in range(D)], dim=1)
-                else:
-                    x_pred_prev = None
-
-                new_step = x_pred_prev.unsqueeze(1) if if_pred_nxt else raw[:, t:t+1, :]
-                condition_x_last = torch.cat([condition_x_last[:,1:,:], new_step], dim=1)
+                # update lag buffer with **true** y (teacher forcing)
+                if K > 0:
+                    lag = torch.cat([lag[:, 1:, :], x_true.unsqueeze(1)], dim=1)
 
             loss.backward()
-            clip_grad_value_(
-                [p for rn in rnn_list for p in rn.parameters()] + [p for cnf in cnfs for p in cnf.parameters()],
-                clip_value=1.0
-            )
+            clip_grad_value_(list(rnn_y.parameters()) + list(rnn_a.parameters()) + list(cnf_y.parameters()), 1.0)
             opt.step()
             total_loss += loss.item()
             loop.set_postfix(loss=total_loss / (loop.n + 1))
 
-        avg_node_train = { i: (node_loss_sum[i] / node_count[i]) if node_count[i]>0 else float('inf') for i in range(D) }
-        avg = total_loss / len(train_loader)
-        print(f"Epoch {epoch+1:2d}, avg flow‐matching loss {avg:.6f}")
-
-        if (epoch+1) % 5 == 0:
-            save_dir = f"simulation/new_trained_model_simulation/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
+        print(f"Epoch {epoch+1:2d} | avg flow-matching loss {total_loss/len(train_loader):.6f}")
+        if (epoch+1) % 2 == 0:
+            save_dir = f"/storage/home/hcoda1/3/dwu381/p-yxie77-0/DoFlow/treatment/context_55_prediction_5"
             os.makedirs(save_dir, exist_ok=True)
-            for i, rn in enumerate(rnn_list):
-                torch.save(rn.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_node_{i}.pth"))
-            for i, cnf in enumerate(cnfs):
-                torch.save(cnf.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_cnf_node_{i}.pth"))
+            torch.save(rnn_y.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_y.pth"))
+            torch.save(rnn_a.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_a.pth"))
+            torch.save(cnf_y.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_cnf_y.pth"))
             print(f"Models saved under {save_dir}")
-            print("Running test on observational forecasting...")
-            output_dir = f"simulation/new_results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-            main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-                prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=epoch+1, num_ens=30, use_parents=use_parents, device=device
-            )
-
-            print("Running test on interventional...")
-            main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-                prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=epoch+1, num_ens=30, use_parents=use_parents, device=device
-            )
-            print("Running test on counterfactual...")
-            main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-                prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=epoch+1, num_ens=30, use_parents=use_parents, device=device
-            )
