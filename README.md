@@ -30,29 +30,37 @@ After downloading, please ensure the data is saved to the following directory st
 ```
 
 ### Credit: This benchmark is based on the following work:
+```bash
 @inproceedings{bica2020crn,
   title={Estimating counterfactual treatment outcomes over time through adversarially balanced representations},
   author={Bica, Ioana and Alaa, Ahmed and Jordon, James and van der Schaar, Mihaela},
   booktitle={International Conference on Learning Representations},
   year={2020}
 }
+```
 
 ## Usage
 For improved readability and ease of reproduction, we have consolidated the core functions into standalone scripts.
 
-** General Simulation & Experiments
+### General Simulation & Experiments
 To reproduce the main synthetic experiments or explore the model structure:
+```bash
 python main_simulation.py
+```
 
-** Cancer Treatment Experiments
+### Cancer Treatment Experiments
 Once the data is set up in data/cancer_treatment, you can run the treatment effect estimation experiments:
+```bash
 python main_treatment.py
+```
 
 ## Citation
 If you find this code or paper useful for your research, please cite our work:
+```bash
 @inproceedings{wu2026doflow,
   title={DoFlow: Flow-based Generative Models for Interventional and Counterfactual Forecasting on Time Series},
   author={Wu, Dongze and Xie, Yao},
   booktitle={International Conference on Learning Representations},
   year={2026}
 }
+```
