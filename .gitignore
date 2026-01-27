@@ -17,7 +17,13 @@ simulation/results/
 simulation/new_results/
 simulation/trained_model_simulation/
 simulation/new_trained_model_simulation/
+simulation/simulated_data/
+simulation/
 
+main_simulation_original.py
+main_treatment_original.py
+utils_original.py
+treatment/
 # Data
 data/
 

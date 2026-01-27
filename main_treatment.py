@@ -19,6 +19,9 @@ from utils import (
     metrics,
 )
 import time
+from test_cancer import to_t, rollout_one_option
+from collections import defaultdict
+
 
 print("done importing")
 
@@ -96,68 +99,28 @@ class CNF(nn.Module):
         dx  = self.net(inp)
         return dx
     
-    def sample(self,
-               cond_states: torch.Tensor,   # (B, cond_dim)
-               num_steps: int = 20,
-               method: str = 'rk4',
-               forward: bool = False,
-               density: bool = False,
-               z0: Optional[torch.Tensor] = None):
-        B, _ = cond_states.shape
-        device = cond_states.device
-
+    @torch.no_grad()
+    def sample(self, cond_states, num_steps=20, method='rk4', forward=False, density=False, z0=None):
+        # Minimal sampler compatible with training API: Euler fallback for simplicity.
+        # Uses fixed-step integration over s in [0,1].
+        B = cond_states.size(0)
         D = self.data_dim
+        device = cond_states.device
         if z0 is None:
-            z0 = torch.randn(B, D, device=device)
-            y0 = z0
+            y = torch.randn(B, D, device=device)
         else:
-            y0 = z0
+            y = z0
 
-        logp0  = -0.5 * (y0**2).sum(dim=1, keepdim=True) - (D/2) * math.log(2 * math.pi)
-        M = 1
-        sigma = 5e-3
-        eps = torch.randn(M, B, D, device=device) if density else None
-
-        def ode_func(t, states):
-            if density:
-                y, logp = states
-            else:
-                y = states
-            batch = y.shape[0]
-            if forward:
-                s = (t).reshape(1,1).expand(batch,1)
-                sign = 1
-            else:
-                s = (1 - t).reshape(1,1).expand(batch,1)
-                sign = -1
-            
-            inp = torch.cat([y, cond_states], dim=1)
-            dx  = self.forward(s, inp)
-            if density:
-                y_eps = y.unsqueeze(0).expand(M, B, D) + sigma * eps
-                cond_eps = cond_states.unsqueeze(0).expand(M, B, self.cond_dim)
-                y_flat    = y_eps.reshape(M*B, D)
-                cond_flat = cond_eps.reshape(M*B, self.cond_dim)
-                s_flat    = s.unsqueeze(0).expand(M, batch, 1).reshape(M*B, 1)
-
-                states_flat = torch.cat([y_flat, cond_flat], dim=1)
-                dx_flat     = self.forward(s_flat, states_flat)
-                dx_eps      = dx_flat.reshape(M, B, D)
-                diff = (dx_eps - dx.unsqueeze(0)) / sigma
-                trace = (eps * diff).sum(dim=2).mean(dim=0, keepdim=True)
-                dydt  = sign * dx
-                dlogp = -sign * trace.T
-                return dydt, dlogp
-            else:
-                return sign * dx
-
-        t_grid = torch.linspace(0.0, 1.0, num_steps, device=device)
-        if density:
-            yT, logpT = odeint(ode_func, (y0, logp0), t_grid, method=method)
-            return yT[-1], logpT[-1]
-        else:
-            yT = odeint(ode_func, y0, t_grid, method=method)
-            return yT[-1], None
+        # integrate ds (reverse-time for generative sampling)
+        steps = num_steps
+        dt = 1.0 / steps
+        for k in range(steps):
+            # reverse-time: s = 1 - t, so use sign = -1
+            s = (1.0 - k * dt) if not forward else (k * dt)
+            s_t = torch.full((B, 1), s, device=device)
+            dy = self.forward(s_t, torch.cat([y, cond_states], dim=1))
+            y = y - dy * dt if not forward else y + dy * dt
+        return y, None
 
 
 class CancerTrainDataset(Dataset):
@@ -215,411 +178,6 @@ class CancerTrainDataset(Dataset):
             "N_ctx_n": N_ctx_n,
             "N_fut_n": N_fut_n,
         }
-
-
-# =========================
-# Inference/Test helpers (new; factorized)
-# =========================
-
-def _prepare_test_batch(test_ds, idxs, context_length, device):
-    X_batch = torch.stack([test_ds[i] for i in idxs], dim=0).to(device)
-    ctx = X_batch[:, :context_length, :]
-    fut = X_batch[:, context_length:, :]
-    return ctx, fut
-
-def _scale_context(ctx, D, scaler: MeanScaler, K: int):
-    """
-    Always scale; returns:
-      ctx_in: (B, ctx, D+TF),
-      norm_ctx: (B, ctx, D),
-      loc: (B,1,D), scale: (B,1,D),
-      buf0: (B, K, D)
-    """
-    ctx_raw = ctx[..., :D]
-    ctx_time = ctx[..., D:]
-    norm_ctx, loc, scale = scaler(ctx_raw)
-    ctx_in = torch.cat([norm_ctx, ctx_time], dim=-1)
-    buf0 = norm_ctx[:, -K:, :] if K > 0 else norm_ctx[:, :0, :]
-    return ctx_in, norm_ctx, loc, scale, buf0
-
-def _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0):
-    """
-    Run initial pass over context to get per-node hidden states.
-    Returns:
-      hidden: list of (h_n, c_n) per node (broadcast to ensembles)
-      h_list: dict node->top hidden per chain
-      condition_x_last: (B*num_ens, K, D)
-      B_e: int
-      TF: int
-    """
-    B, context_length, _ = ctx_in.shape
-    TF = ctx_in.shape[-1] - D
-
-    hidden = [None] * D
-    h_list = {}
-
-    for i, rn in enumerate(rnn_list):
-        node_seq = ctx_in[:, :, i:(i+1)]
-        time_feats = ctx_in[:, :, D:]
-        inp = torch.cat([node_seq, time_feats], dim=-1)
-        _, h_top, hid = rn(inp, None)
-        h_n, c_n = hid
-        h_n = h_n.repeat_interleave(num_ens, dim=1)
-        c_n = c_n.repeat_interleave(num_ens, dim=1)
-        hidden[i] = (h_n, c_n)
-        h_list[i] = h_top.repeat_interleave(num_ens, dim=0)
-
-    buf0_e = buf0.unsqueeze(1).expand(B, num_ens, buf0.size(1), D)
-    B_e = B * num_ens
-    condition_x_last = buf0_e.reshape(B_e, buf0.size(1), D).clone()
-    return hidden, h_list, condition_x_last, B_e, TF
-
-def _rollout_observational(
-    fut, parents, order, rnn_list, cnfs,
-    hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens, prediction_length
-):
-    """
-    Pure sampling rollout (observational/forecasting).
-    Returns: samples_arr_torch (T,B,E,D) as a torch tensor on the same device.
-    """
-    device = fut.device
-    all_ens = []
-    with torch.no_grad():
-        for t in range(prediction_length):
-            tf_scalar = fut[:, t, D:]                      # (B,TF)
-            tf_e = tf_scalar.unsqueeze(1).expand(B, num_ens, TF).reshape(B_e, TF).unsqueeze(1)
-
-            x_pred_t = {}
-            h_next = {}
-            for i in order:
-                parts = [h_list[i]]
-                if condition_x_last.size(1) > 0:
-                    parts.append(condition_x_last[:, :, i])
-                if parents[i]:
-                    pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
-                    parts.append(pv)
-                    x_parents_hidden_list = [h_next[j] for j in parents[i]]
-                    parts.extend(x_parents_hidden_list)
-
-                cond_i = torch.cat(parts, dim=1)
-                x_i, _ = cnfs[i].sample(cond_i, density=False)   # stays on device
-                x_pred_t[i] = x_i
-
-                node_seq_e = x_i.view(B_e, 1, 1)
-                rn = rnn_list[i]
-                _, h_top, hid = rn(torch.cat([node_seq_e, tf_e], dim=-1), hidden[i])
-                h_next[i] = h_top
-                hidden[i] = hid
-
-            h_list = h_next
-            x_pred = torch.cat([x_pred_t[i] for i in range(D)], dim=1)  # (B*E, D)
-            all_ens.append(x_pred)
-            condition_x_last = torch.cat([condition_x_last[:, 1:, :], x_pred.unsqueeze(1)], dim=1)
-
-    samples = torch.stack(all_ens, dim=0).cpu().numpy()                # (T, B*E, D)
-    samples_arr = samples.reshape(prediction_length, B, num_ens, D)  # (T,B,E,D)
-    return samples_arr
-
-def _plot_fan_charts_observational(
-    samples_arr, q_inv, ctx, ctx_raw, loc, scale,
-    context_length, prediction_length, fut, D, output_dir, idxs, num_ens, mode="forecasting"
-):
-    B = samples_arr.shape[1]
-    random_chain = np.random.randint(num_ens, size=B)
-    for b in range(min(10, B)):
-        rows = 2 if D <= 8 else (D + 4) // 5
-        cols = 4 if D <= 8 else 5
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
-        axes = axes.flatten()
-
-        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
-        true_b = fut[b, :, :D].cpu().numpy()
-
-        t_ctx = np.arange(context_length - context_length//4, context_length)
-        t_pred = np.arange(context_length, context_length+prediction_length)
-
-        for i in range(D):
-            ax = axes[i]
-            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="context")
-            ax.plot(t_pred, true_b[:, i], label="true")
-            ax.fill_between(t_pred, q_inv[5][:, b, i],  q_inv[95][:, b, i], alpha=0.15, label="90% CI")
-            ax.fill_between(t_pred, q_inv[25][:, b, i], q_inv[75][:, b, i], alpha=0.3,  label="50% CI")
-            ax.legend(fontsize="small")
-        for j in range(D, len(axes)):
-            axes[j].axis("off")
-
-        os.makedirs(output_dir, exist_ok=True)
-        # np.save(os.path.join(output_dir, f"samples_arr_{mode}.npy"), samples_arr)
-        fig.savefig(os.path.join(output_dir, f"observational_plot_idx_{idxs[b]}.png"))
-        plt.close(fig)
-
-def _choose_intervention_set(Type: str):
-    return [0,1,2] if (Type == "two_layer_feed_forward"
-                       or Type == "two_layer_feed_forward_nonlinear"
-                       or Type == "two_layer_feed_forward_2"
-                       or Type.startswith("two_layer_feed_forward_non_additive")) else [0]
-
-def _counterfactual_forward_pass(
-    mode, prediction_length, true_future, D, TF, B, num_ens,
-    rnn_list, cnfs, parents, order,
-    hidden, h_list, condition_x_last, loc, scale
-):
-    """
-    Returns dictionaries needed for CF latent reuse (z_all) and advanced hidden/buffer states.
-    """
-    if mode != "counterfactual":
-        return None, None, None, None
-
-    with torch.no_grad():
-        hidden_tf = [h for h in hidden]
-        h_list_tf = {i: h_list[i].clone() for i in h_list}
-        cond_buffer  = condition_x_last.clone()
-        z_all = {i: [] for i in range(D)}
-        x_true_t = {}
-
-        for t in range(prediction_length):
-            tf_scalar = true_future[:, t, D:]                  # (B,TF)
-            tf_e = tf_scalar.unsqueeze(1).expand(B, num_ens, TF).reshape(B * num_ens, TF).unsqueeze(1)
-            for i in order:
-                true_vals = (true_future[:, t, i] - loc[:,0,i]) / scale[:,0,i]
-                if i == 0:
-                    true_brd  = true_vals.unsqueeze(-1).unsqueeze(1).expand(B, num_ens, 1)
-                    flat_true = true_brd.reshape(B * num_ens, 1)
-                    x_true_t[i] = flat_true
-                    z_all[i].append(None)
-                    node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
-                    out, h_top, hid = rnn_list[0](torch.cat([node_seq_e, tf_e], dim=-1), hidden_tf[0])
-                    hidden_tf[0], h_list_tf[0] = hid, h_top
-                    continue
-
-                parts = [h_list_tf[i]]
-                if cond_buffer.size(1) > 0:
-                    parts.append(cond_buffer[:, :, i])
-                if parents[i]:
-                    pv = torch.cat([cond_buffer[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
-                    parts.append(pv)
-                    x_parents_hidden_list = [h_list_tf[j] for j in parents[i]]
-                    parts.extend(x_parents_hidden_list)
-
-                cond_inv = torch.cat(parts, dim=1)
-                x_true = true_vals.unsqueeze(-1).unsqueeze(-1).expand(B, num_ens, 1).reshape(B * num_ens, 1)
-                x_true_t[i] = x_true
-                z_i, _ = cnfs[i].sample(cond_inv, density=False, forward=True, z0=x_true)
-                z_all[i].append(z_i)
-
-                node_seq_e = x_true.view(B * num_ens, 1, 1)
-                out, h_top, hid = rnn_list[i](torch.cat([node_seq_e, tf_e], -1), hidden_tf[i])
-                hidden_tf[i], h_list_tf[i] = hid, h_top
-
-            new_buf = torch.cat([x_true_t[i] for i in range(D)], dim=1)
-            cond_buffer = torch.cat([cond_buffer[:, 1:, :], new_buf.unsqueeze(1)], dim=1)
-
-    return hidden_tf, h_list_tf, cond_buffer, z_all
-
-def _rollout_interv_cf(
-    fut, mode, inter_set, parents, order, rnn_list, cnfs,
-    hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens,
-    prediction_length, z_all
-):
-    all_ens, logp_list = [], []
-    wider = True
-
-    with torch.no_grad():
-        for t in range(prediction_length):
-            tf_scalar = fut[:, t, D:]
-            tf_e = tf_scalar.unsqueeze(1).expand(B, num_ens, TF).reshape(B_e, TF).unsqueeze(1)
-
-            x_pred_t, x_pred_t_MAP, logp_t, h_next = {}, {}, {}, {}
-            for i in order:
-                if i in inter_set:
-                    true_vals = fut[:, t, i]
-                    true_col  = true_vals.unsqueeze(-1)
-                    true_brd  = true_col.unsqueeze(1).expand(B, num_ens, 1)
-                    flat_true = true_brd.reshape(B * num_ens, 1)
-                    x_pred_t[i] = flat_true
-                    logp_t[i]   = torch.zeros_like(flat_true)
-                    x_pred_t_MAP[i] = flat_true
-
-                    node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
-                    _, h_top, hid = rnn_list[i](torch.cat([node_seq_e, tf_e], dim=-1), hidden[i])
-                    h_next[i]  = h_top
-                    hidden[i]  = hid
-                    continue
-
-                parts = [h_list[i]]
-                if condition_x_last.size(1) > 0:
-                    parts.append(condition_x_last[:, :, i])
-                if parents[i]:
-                    pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
-                    parts.append(pv)
-                    x_parents_hidden_list = [h_next[j] for j in parents[i]]
-                    parts.extend(x_parents_hidden_list)
-
-                cond_i = torch.cat(parts, dim=1)
-                if mode == "interventional":
-                    x_i, logp_i = cnfs[i].sample(cond_i, density=True)
-                else:
-                    z0 = z_all[i][t]
-                    x_i, logp_i = cnfs[i].sample(cond_i, density=True, forward=False, z0=z0)
-
-                x_pred_t[i] = x_i
-                logp_t[i] = logp_i
-
-                # MAP chain per batch
-                x_i_resh   = x_i.view(B, num_ens, -1)
-                logp_flat  = logp_i.view(B, num_ens, -1).squeeze(-1)
-                best_idx   = logp_flat.argmax(dim=1)
-                x_flat     = x_i_resh.squeeze(-1)
-                x_best     = x_flat[torch.arange(B), best_idx]
-                x_best_rep = x_best.unsqueeze(1).expand(B, num_ens)
-                x_pred_t_MAP[i] = x_best_rep.reshape(B * num_ens, 1)
-
-                node_seq_e = x_i.view(B_e, 1, 1)
-                _, h_top, hid = rnn_list[i](torch.cat([node_seq_e, tf_e], dim=-1), hidden[i])
-                h_next[i] = h_top
-                hidden[i] = hid
-
-            h_list = h_next
-            x_pred_MAP = torch.cat([x_pred_t_MAP[i] for i in range(D)], dim=1)
-            x_pred = torch.cat([x_pred_t[i] for i in range(D)], dim=1)
-            logp = torch.cat([logp_t[i] for i in range(D)], dim=1)
-            all_ens.append(x_pred)
-            logp_list.append(logp)
-
-            if wider:
-                condition_x_last = torch.cat([condition_x_last[:, 1:, :], x_pred.unsqueeze(1)], dim=1)
-            else:
-                condition_x_last = torch.cat([condition_x_last[:, 1:, :], x_pred_MAP.unsqueeze(1)], dim=1)
-
-    samples = torch.stack(all_ens, dim=0).cpu().numpy()
-    samples_arr = samples.reshape(prediction_length, B, num_ens, D)
-    return samples_arr, logp_list
-
-def _plot_interv_cf(
-    samples_arr, q_dict, ctx_raw, loc, scale,
-    context_length, prediction_length, fut, true_future,
-    D, output_dir, idxs, inter_set, mode
-):
-    B = samples_arr.shape[1]
-    mean_samples = samples_arr.mean(axis=2)
-    loc_np   = loc.cpu().numpy().squeeze(1)
-    scale_np = scale.cpu().numpy().squeeze(1)
-
-    for b in range(min(5, len(idxs))):
-        rows = 2 if D <= 8 else (D + 4) // 5
-        cols = 4 if D <= 8 else 5
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
-        fig.suptitle('Interventional Forecasting' if mode == "interventional" else 'Counterfactual Forecasting',
-                     fontsize=23, weight='bold')
-        axes = axes.flatten()
-
-        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
-        true_b = fut[b, :, :D].cpu().numpy()     # simulated target (int./cf baseline)
-
-        # if mode == "counterfactual":
-        #     true_b = 0.93 * true_b + 0.07 * mean_samples[:, b, :]
-        # elif mode == "interventional":
-        #     true_b = (true_b + mean_samples[:, b, :]) / 2
-
-        true_future_b = true_future[b, :, :D].cpu().numpy()
-
-        t_ctx = np.arange(context_length - context_length//4, context_length)
-        t_pred = np.arange(context_length, context_length+prediction_length)
-
-        for i in range(D):
-            ax = axes[i]
-            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="Context")
-            ax.plot(t_pred, true_b[:, i], label=("Conducted Int." if i in inter_set else ("Int. Future" if mode=="interventional" else "CF. Future")), color="orange")
-            ax.plot(t_pred, true_future_b[:, i], label="Obs. Future", linestyle=':', linewidth=0.9, color='gray', alpha=0.8)
-
-            if mode == "counterfactual" and i not in inter_set:
-                sample_chain = samples_arr[:, b, 0, i] * scale_np[b, i] + loc_np[b, i]
-                ax.plot(t_pred, sample_chain, label="Est. CF.", color="mediumseagreen")
-
-            if i >= len(inter_set) and mode == "interventional":
-                ax.fill_between(t_pred, q_dict[5][:, b, i],  q_dict[95][:, b, i], alpha=0.15, label="Est. Int. 90% CI")
-                ax.fill_between(t_pred, q_dict[25][:, b, i], q_dict[75][:, b, i], alpha=0.3,  label="Est. Int. 50% CI")
-
-            ax.axvline(context_length, ls="--", color="k", lw=1, alpha=0.7, label=("Int. start" if mode=="interventional" and i==0 else ("CF. start" if mode!="interventional" and i==0 else None)))
-            ax.set_title(rf"$X_{{{i+1},t}} (Intervened)$" if i < len(inter_set) else rf"$X_{{{i+1},t}}$", fontsize=22)
-
-            if i == 0 or i == D//2:
-                ax.legend(fontsize=12.5, loc="lower left", framealpha=0.7)
-            else:
-                ax.legend().set_visible(False)
-            ax.tick_params(axis='both', which='major', labelsize=10.5)
-
-        for j in range(D, len(axes)):
-            axes[j].axis("off")
-
-        os.makedirs(output_dir, exist_ok=True)
-        save_path = os.path.join(output_dir, f"interv_plot_idx_{idxs[b]}.png" if mode == "interventional" else f"cf_plot_idx_{idxs[b]}.png")
-        fig.savefig(save_path, bbox_inches="tight")
-        # fig.savefig(save_path.replace('.png', '.pdf'), bbox_inches="tight", format='pdf')
-        plt.close(fig)
-
-
-# =========================
-# Testing
-# =========================
-
-
-def test_interv_cf(
-    test_ds, rnn_list, cnfs, epoch, parents,
-    context_length, prediction_length, device,
-    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type='cyclic', mode="counterfactual"
-):
-    """
-    Interventional / Counterfactual rollout with fan charts.
-    """
-    for rn in rnn_list: rn.eval()
-    for cnf in cnfs: cnf.eval()
-    order = topo_sort(parents)
-
-    inter_set = _choose_intervention_set(Type)
-
-    random_idxs = torch.randint(0, 1000, (1000,)).tolist()
-    idxs = random_idxs
-
-    D = len(parents)
-    B = len(idxs)
-    ctx, fut_obs = _prepare_test_batch(test_ds, idxs, context_length, device)
-    ctx_in, norm_ctx, loc, scale, buf0 = _scale_context(ctx, D, scaler, K)
-
-    true_future = fut_obs.clone()
-    if mode == "interventional":
-        fut = simulate_future_interventional(Type, B, D, parents, prediction_length, device, ctx, true_future).to(device)
-    elif mode == "counterfactual":
-        fut = simulate_future_counterfactual(Type, ctx, parents, prediction_length, device, true_future, inter_set).to(device)
-    else:
-        raise ValueError("mode must be 'interventional' or 'counterfactual'")
-
-    hidden, h_list, condition_x_last, B_e, TF = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
-    if mode == "counterfactual":
-        _, _, _, z_all = _counterfactual_forward_pass(
-            mode, prediction_length, true_future, D, TF, B, num_ens,
-            rnn_list, cnfs, parents, order, hidden, h_list, condition_x_last, loc, scale
-        )
-    else:
-        z_all = None
-
-    samples_arr, logp_list = _rollout_interv_cf(
-        fut, mode, inter_set, parents, order, rnn_list, cnfs,
-        hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens,
-        prediction_length, z_all
-    )
-
-
-    logp_sum, logp_mean, logp_std, q5, q10, q25, q50, q75, q90, q95 = quantiles_and_logp(
-        logp_list, samples_arr, device, loc, scale
-    )
-    q_dict = {5:q5.cpu().numpy(), 10:q10.cpu().numpy(), 25:q25.cpu().numpy(), 50:q50.cpu().numpy(), 75:q75.cpu().numpy(), 90:q90.cpu().numpy(), 95:q95.cpu().numpy()}
-    metrics(fut, samples_arr, device, loc, scale, output_dir, mode)
-
-    _plot_interv_cf(samples_arr, q_dict, norm_ctx, loc, scale,
-             context_length, prediction_length, fut, true_future,
-             D, output_dir, idxs, inter_set, mode)
-
 
 
 
@@ -739,9 +297,102 @@ if __name__ == "__main__":
 
         print(f"Epoch {epoch+1:2d} | avg flow-matching loss {total_loss/len(train_loader):.6f}")
         if (epoch+1) % 2 == 0:
-            save_dir = f"/storage/home/hcoda1/3/dwu381/p-yxie77-0/DoFlow/treatment/context_55_prediction_5"
+            save_dir = "treatment/context_55_prediction_5"
             os.makedirs(save_dir, exist_ok=True)
             torch.save(rnn_y.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_y.pth"))
             torch.save(rnn_a.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_a.pth"))
             torch.save(cnf_y.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_cnf_y.pth"))
             print(f"Models saved under {save_dir}")
+    
+
+
+    print("########################################################")
+    print("### Done training! Now testing...                      ###")
+    print("########################################################")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    VMAX = 1150.0  # used to normalize RMSE to % (based on the original paper)
+
+
+    ckpt_dir = "treatment/context_55_prediction_5"
+    ckpt_epoch = 4
+
+    # Saved models
+    rnn_y = RNN(input_size=1,  hidden_size=H, num_layers=4).to(device)
+    rnn_a = RNN(input_size=DA, hidden_size=H, num_layers=4).to(device)
+    cnf_y  = CNF(data_dim=1, cond_dim=H + H + K, hidden_dim=64, num_layers=3).to(device)
+
+    rnn_y.load_state_dict(torch.load(os.path.join(ckpt_dir, f"epoch_{ckpt_epoch}_rnn_y.pth"), map_location=device))
+    rnn_a.load_state_dict(torch.load(os.path.join(ckpt_dir, f"epoch_{ckpt_epoch}_rnn_a.pth"), map_location=device))
+    cnf_y.load_state_dict(torch.load(os.path.join(ckpt_dir, f"epoch_{ckpt_epoch}_cnf_y.pth"), map_location=device))
+
+    rnn_y.eval(); rnn_a.eval(); cnf_y.eval()
+
+
+    ctx_path  = "data/cancer_treatment/test_sequence_context_t0_54.csv"
+    final5_path = "data/cancer_treatment/test_sequence_final5.csv"
+
+    ctx_df   = pd.read_csv(ctx_path).sort_values(["patient_id","time"]).reset_index(drop=True)
+    final_df = pd.read_csv(final5_path).sort_values(["patient_id","option_id","time"]).reset_index(drop=True)
+
+    # Sanity: expect time 0..54 in ctx; time 55..59 in final
+    assert ctx_df["time"].min() == 0 and ctx_df["time"].max() == 54, "Unexpected ctx time range"
+    assert final_df["time"].min() == 55 and final_df["time"].max() == 59, "Unexpected final5 time range"
+
+    all_sq_errors = []   # collect ((pred - true)/VMAX)**2 across all patients/options
+    per_patient_option = defaultdict(list)
+
+    patients = ctx_df["patient_id"].unique().tolist()
+    print(f"#patients in test: {len(patients)}")
+
+    for pid in tqdm(patients):
+        g_ctx = ctx_df[ctx_df["patient_id"] == pid].sort_values("time")
+        y_ctx = to_t(g_ctx["cancer_volume"].values, device=device).view(-1,1)
+        y_loc = y_ctx.mean()
+        y_std = y_ctx.std()
+        if torch.isnan(y_std) or y_std < 1e-8:
+            y_std = torch.tensor(1e-5, device=device)
+        y_ctx_n = (y_ctx - y_loc) / y_std
+
+        Capp = to_t(g_ctx["chemo_application"].values, device=device).view(-1,1)
+        Rapp = to_t(g_ctx["radio_application"].values, device=device).view(-1,1)
+        Cdose = torch.zeros_like(Capp)
+        Rdose = torch.zeros_like(Rapp)
+        A_ctx = torch.cat([Capp, Rapp, Cdose, Rdose], dim=1)
+
+        g_fin = final_df[final_df["patient_id"] == pid]
+        if g_fin.empty:
+            continue
+        option_ids = sorted(g_fin["option_id"].unique().tolist())
+
+        for oid in option_ids:
+            rows = g_fin[g_fin["option_id"] == oid].sort_values("time")
+            if len(rows) != 5:
+                continue
+
+            # Get final-step predicted & true volumes (not normalized)
+            pred_last_vol, true_last_vol = rollout_one_option(
+                y_ctx_n, A_ctx, y_loc, y_std, rows,
+                rnn_y, rnn_a, cnf_y, device, K, DA
+            )
+
+            # squared error, normalized by VMAX
+            se_norm = ((pred_last_vol - true_last_vol) / VMAX) ** 2
+            all_sq_errors.append(se_norm)
+            per_patient_option[pid].append((oid, math.sqrt(se_norm) * 100.0))
+
+    # ----------------------------
+    # Reporting
+    # ----------------------------
+    print("\n=== Per-patient per-option NRMSE at horizon (%, optional preview) ===")
+    for pid in sorted(per_patient_option.keys())[:10]:  # preview first 10 patients
+        entries = sorted(per_patient_option[pid], key=lambda x: x[0])
+        s = ", ".join([f"opt{oid}: {nrmse:.3f}%" for oid, nrmse in entries])
+        print(f"patient {pid}: {s}")
+
+    if all_sq_errors:
+        rmse_norm_pct = 100.0 * math.sqrt(float(np.mean(all_sq_errors)))
+    else:
+        rmse_norm_pct = float("nan")
+
+    print(f"\nOverall Normalized RMSE at t+5 (as % of Vmax={VMAX}): {rmse_norm_pct:.4f}%")
