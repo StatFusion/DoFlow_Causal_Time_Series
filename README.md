@@ -27,6 +27,7 @@ After downloading, please ensure the data is saved to the following directory st
 │       └── <downloaded_files_here>
 ├── main_treatment.py
 └── ...
+```
 
 ### Credit: This benchmark is based on the following work:
 @inproceedings{bica2020crn,
