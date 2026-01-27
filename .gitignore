@@ -25,7 +25,9 @@ main_treatment_original.py
 utils_original.py
 treatment/
 # Data
-data/
+data/simulated_data/
+data/LO71-All-data-2018_0101-2020_1231-processed.csv
+data/LO93-All-data-2018_0101-2020_1231-processed.csv
 
 # OS/editor junk
 .DS_Store

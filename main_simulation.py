@@ -289,6 +289,7 @@ def _rollout_observational(
         for t in range(prediction_length):
             x_pred_t = {}
             h_next = {}
+            # prediction proceeds in topological order (parents first; children last)
             for i in order:
                 parts = [h_list[i]]
                 if condition_x_last.size(1) > 0:
@@ -297,6 +298,7 @@ def _rollout_observational(
                     pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
                     x_parents_hidden_list = [h_next[j] for j in parents[i]]
+                    # x_parents_hidden_list = [h_list[j] for j in parents[i]]
                     parts.extend(x_parents_hidden_list)
 
                 cond_i = torch.cat(parts, dim=1)
@@ -377,8 +379,6 @@ def _counterfactual_forward_pass(
         x_true_t = {}
 
         for t in range(prediction_length):
-            # tf_scalar = true_future[:, t, D:]                  # (B,TF)
-            # tf_e = tf_scalar.unsqueeze(1).expand(B, num_ens, TF).reshape(B * num_ens, TF).unsqueeze(1)
             for i in order:
                 true_vals = (true_future[:, t, i] - loc[:,0,i]) / scale[:,0,i]
                 if i == 0:
@@ -387,7 +387,6 @@ def _counterfactual_forward_pass(
                     x_true_t[i] = flat_true
                     z_all[i].append(None)
                     node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
-                    # out, h_top, hid = rnn_list[0](torch.cat([node_seq_e, tf_e], dim=-1), hidden_tf[0])
                     out, h_top, hid = rnn_list[0](node_seq_e, hidden_tf[0])
                     hidden_tf[0], h_list_tf[0] = hid, h_top
                     continue
@@ -408,7 +407,6 @@ def _counterfactual_forward_pass(
                 z_all[i].append(z_i)
 
                 node_seq_e = x_true.view(B * num_ens, 1, 1)
-                # out, h_top, hid = rnn_list[i](torch.cat([node_seq_e, tf_e], -1), hidden_tf[i])
                 out, h_top, hid = rnn_list[i](node_seq_e, hidden_tf[i])
                 hidden_tf[i], h_list_tf[i] = hid, h_top
 
@@ -429,6 +427,7 @@ def _rollout_interv_cf(
 
             x_pred_t, x_pred_t_MAP, logp_t, h_next = {}, {}, {}, {}
 
+            # prediction proceeds in topological order (parents first; children last)
             for i in order:
                 if i in inter_set:
                     # Intervening the root nodes with the simulated true values
@@ -458,6 +457,7 @@ def _rollout_interv_cf(
                     pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
                     x_parents_hidden_list = [h_next[j] for j in parents[i]]
+                    # x_parents_hidden_list = [h_list[j] for j in parents[i]]
                     parts.extend(x_parents_hidden_list)
 
                 cond_i = torch.cat(parts, dim=1)
