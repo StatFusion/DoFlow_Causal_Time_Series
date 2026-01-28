@@ -79,7 +79,7 @@ def simulate_future_interventional(Type, B, D, parents, prediction_length, devic
             prev = X[:, t-1, :]          # previous step (B, D)
             for i in range(1, D):
                 ar = beta_diag[i] * prev[:, i]
-                infl = sum(beta_par[(i, j)] * prev[:, j] for j in parents[i])  # or your infl rule
+                infl = sum(beta_par[(i, j)] * prev[:, j] for j in parents[i]) 
                 X[:, t, i] = ar + infl + noise[i][:, t]
 
         fut_slice = X

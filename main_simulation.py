@@ -20,7 +20,6 @@ from utils import (
 )
 import time
 
-print("done importing")
 
 
 # =========================
@@ -297,8 +296,7 @@ def _rollout_observational(
                 if parents[i]:
                     pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
-                    x_parents_hidden_list = [h_next[j] for j in parents[i]]
-                    # x_parents_hidden_list = [h_list[j] for j in parents[i]]
+                    x_parents_hidden_list = [h_list[j] for j in parents[i]]
                     parts.extend(x_parents_hidden_list)
 
                 cond_i = torch.cat(parts, dim=1)
@@ -307,7 +305,6 @@ def _rollout_observational(
 
                 node_seq_e = x_i.view(B_e, 1, 1)
                 rn = rnn_list[i]
-                # _, h_top, hid = rn(torch.cat([node_seq_e, tf_e], dim=-1), hidden[i])
                 _, h_top, hid = rn(node_seq_e, hidden[i])
                 h_next[i] = h_top
                 hidden[i] = hid
@@ -381,15 +378,16 @@ def _counterfactual_forward_pass(
         for t in range(prediction_length):
             for i in order:
                 true_vals = (true_future[:, t, i] - loc[:,0,i]) / scale[:,0,i]
-                if i == 0:
-                    true_brd  = true_vals.unsqueeze(-1).unsqueeze(1).expand(B, num_ens, 1)
-                    flat_true = true_brd.reshape(B * num_ens, 1)
-                    x_true_t[i] = flat_true
-                    z_all[i].append(None)
-                    node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
-                    out, h_top, hid = rnn_list[0](node_seq_e, hidden_tf[0])
-                    hidden_tf[0], h_list_tf[0] = hid, h_top
-                    continue
+
+                # if i == 0:
+                #     true_brd  = true_vals.unsqueeze(-1).unsqueeze(1).expand(B, num_ens, 1)
+                #     flat_true = true_brd.reshape(B * num_ens, 1)
+                #     x_true_t[i] = flat_true
+                #     z_all[i].append(None)
+                #     node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
+                #     out, h_top, hid = rnn_list[0](node_seq_e, hidden_tf[0])
+                #     hidden_tf[0], h_list_tf[0] = hid, h_top
+                #     continue
 
                 parts = [h_list_tf[i]]
                 if cond_buffer.size(1) > 0:
@@ -456,8 +454,7 @@ def _rollout_interv_cf(
                     # condition includes its parents' last-step values
                     pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
-                    x_parents_hidden_list = [h_next[j] for j in parents[i]]
-                    # x_parents_hidden_list = [h_list[j] for j in parents[i]]
+                    x_parents_hidden_list = [h_list[j] for j in parents[i]]
                     parts.extend(x_parents_hidden_list)
 
                 cond_i = torch.cat(parts, dim=1)
@@ -469,28 +466,14 @@ def _rollout_interv_cf(
 
                 x_pred_t[i] = x_i
                 logp_t[i] = logp_i
-
-                # MAP chain per batch
-                x_i_resh   = x_i.view(B, num_ens, -1)
-                # logp_flat  = logp_i.view(B, num_ens, -1).squeeze(-1)
-                # best_idx   = logp_flat.argmax(dim=1)
-                # x_flat     = x_i_resh.squeeze(-1)
-                # x_best     = x_flat[torch.arange(B), best_idx]
-                # x_best_rep = x_best.unsqueeze(1).expand(B, num_ens)
-                # x_pred_t_MAP[i] = x_best_rep.reshape(B * num_ens, 1)
-
                 node_seq_e = x_i.view(B_e, 1, 1)
-                # _, h_top, hid = rnn_list[i](torch.cat([node_seq_e, tf_e], dim=-1), hidden[i])
                 _, h_top, hid = rnn_list[i](node_seq_e, hidden[i])
                 h_next[i] = h_top
                 hidden[i] = hid
 
             h_list = h_next
-            # x_pred_MAP = torch.cat([x_pred_t_MAP[i] for i in range(D)], dim=1)
             x_pred = torch.cat([x_pred_t[i] for i in range(D)], dim=1)
-            # logp = torch.cat([logp_t[i] for i in range(D)], dim=1)
             all_ens.append(x_pred)
-            # logp_list.append(logp)
 
 
             condition_x_last = torch.cat([condition_x_last[:, 1:, :], x_pred.unsqueeze(1)], dim=1)
@@ -871,30 +854,30 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     N_epochs = 10
 
-    # if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
-    #     print(f"Models already exist. Loading models from {save_dir}")
-    #     for i, rn in enumerate(rnn_list):
-    #         rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
-    #         rn.eval()
-    #     for i, cnf in enumerate(cnfs):
-    #         cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
-    #         cnf.eval()
-    #     # print("Running test on observational forecasting...")
-    #     output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-    #     # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #     #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     # )
+    if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
+        print(f"Models already exist. Loading models from {save_dir}")
+        for i, rn in enumerate(rnn_list):
+            rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
+            rn.eval()
+        for i, cnf in enumerate(cnfs):
+            cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
+            cnf.eval()
+        # print("Running test on observational forecasting...")
+        output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
+        # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        # )
 
-    #     print("Running test on interventional...")
-    #     main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     )
+        # print("Running test on interventional...")
+        # main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        # )
 
-    #     print("Running test on counterfactual...")
-    #     main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     )
-    #     N_epochs = 0
+        print("Running test on counterfactual...")
+        main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+            prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        )
+        N_epochs = 0
 
 
     for epoch in range(N_epochs):
@@ -915,20 +898,16 @@ if __name__ == "__main__":
 
             # always mean-scale
             ctx_raw  = ctx[..., :D]
-            # ctx_time = ctx[..., D:]
             norm_ctx, loc, scale = scaler(ctx_raw)
 
             raw = (raw - loc) / scale
-            # fut = torch.cat([raw, fut[..., D:]], dim=-1)
             fut = raw
-            # ctx_in = torch.cat([norm_ctx, ctx_time], dim=-1)
             ctx_in = norm_ctx
 
             # per-node forward over ctx_in
             hidden = [None]*D
             h = []
             for i, rn in enumerate(rnn_list):
-                # inp = torch.cat([ctx_in[..., i:(i+1)], ctx_in[..., D:]], dim=-1)
                 inp = ctx_in[..., i:(i+1)]
                 _, h_top, hid = rn(inp, hidden[i])
                 h.append(h_top)
@@ -941,14 +920,11 @@ if __name__ == "__main__":
 
             for t in range(prediction_length):
                 x_true = raw[:, t:t+1, :]
-                # tf_t   = fut[:, t:t+1, D:]
-
                 step_in_rnn = fut[:, t:t+1, :]
 
                 h_curr = h_next if t > 0 else h
                 h_next = []
                 for i, rn in enumerate(rnn_list):
-                    # inp = torch.cat([step_in_rnn[..., i:(i+1)], step_in_rnn[..., D:]], dim=-1)
                     inp = step_in_rnn[..., i:(i+1)]
                     _, h_i, hid_i = rn(inp, hidden[i])
                     h_next.append(h_i)
@@ -957,7 +933,7 @@ if __name__ == "__main__":
                 for i in range(D):
                     x_i = x_true[:, 0, i].unsqueeze(1)
                     if use_parents:
-                        x_parents_hidden_list = [h_next[j] for j in parents[i]]
+                        x_parents_hidden_list = [h_curr[j] for j in parents[i]]
                         x_parents_list = condition_x_last[:, -1, parents[i]]
                         if K > 0:
                             cond = torch.cat([h_curr[i], condition_x_last[:,:,i], x_parents_list] + x_parents_hidden_list, dim=1)
