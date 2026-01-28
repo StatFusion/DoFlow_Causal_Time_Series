@@ -827,11 +827,11 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # Type = "tree_linear"
+    Type = "tree_linear"
     # Type = "layer_nonlinear"
     # Type = "diamond_linear"
     # Type = "chain_linear"
-    Type = "chain_nonlinear"
+    # Type = "chain_nonlinear"
 
     path = f'data/simulated_data/simulated_timeseries_{Type}.csv'
     df = pd.read_csv(path)
@@ -888,32 +888,32 @@ if __name__ == "__main__":
     #########################################################
     save_dir = f"simulation/trained_model_simulation/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
     os.makedirs(save_dir, exist_ok=True)
-    N_epochs = 5
+    N_epochs = 10
 
-    if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
-        print(f"Models already exist. Loading models from {save_dir}")
-        for i, rn in enumerate(rnn_list):
-            rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
-            rn.eval()
-        for i, cnf in enumerate(cnfs):
-            cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
-            cnf.eval()
-        # print("Running test on observational forecasting...")
-        output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-        # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        # )
+    # if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
+    #     print(f"Models already exist. Loading models from {save_dir}")
+    #     for i, rn in enumerate(rnn_list):
+    #         rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
+    #         rn.eval()
+    #     for i, cnf in enumerate(cnfs):
+    #         cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
+    #         cnf.eval()
+    #     # print("Running test on observational forecasting...")
+    #     output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
+    #     # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #     #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     # )
 
-        # print("Running test on interventional...")
-        # main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        # )
+    #     # print("Running test on interventional...")
+    #     # main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #     #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     # )
 
-        print("Running test on counterfactual...")
-        main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-            prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        )
-        N_epochs = 0
+    #     print("Running test on counterfactual...")
+    #     main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     )
+    #     N_epochs = 0
 
 
     for epoch in range(N_epochs):

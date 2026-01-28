@@ -30,7 +30,7 @@ treatment/
 data/LO71-All-data-2018_0101-2020_1231-processed.csv
 data/LO93-All-data-2018_0101-2020_1231-processed.csv
 data/cancer_treatment
-
+runcode.sbatch
 # OS/editor junk
 .DS_Store
 Thumbs.db
