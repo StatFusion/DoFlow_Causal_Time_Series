@@ -352,10 +352,7 @@ def _plot_fan_charts_observational(
         plt.close(fig)
 
 def _choose_intervention_set(Type: str):
-    return [0,1,2] if (Type == "two_layer_feed_forward"
-                       or Type == "two_layer_feed_forward_nonlinear"
-                       or Type == "two_layer_feed_forward_2"
-                       or Type.startswith("two_layer_feed_forward_non_additive")) else [0]
+    return [0,1,2] if (Type == "layer_nonlinear") else [0]
 
 def _counterfactual_forward_pass(
     mode, prediction_length, true_future, D, TF, B, num_ens,
@@ -376,26 +373,24 @@ def _counterfactual_forward_pass(
         x_true_t = {}
 
         for t in range(prediction_length):
+
+            h_prev = {k: v for k, v in h_list_tf.items()} ##
+
             for i in order:
                 true_vals = (true_future[:, t, i] - loc[:,0,i]) / scale[:,0,i]
 
-                # if i == 0:
-                #     true_brd  = true_vals.unsqueeze(-1).unsqueeze(1).expand(B, num_ens, 1)
-                #     flat_true = true_brd.reshape(B * num_ens, 1)
-                #     x_true_t[i] = flat_true
-                #     z_all[i].append(None)
-                #     node_seq_e = true_brd.reshape(B * num_ens, 1, 1)
-                #     out, h_top, hid = rnn_list[0](node_seq_e, hidden_tf[0])
-                #     hidden_tf[0], h_list_tf[0] = hid, h_top
-                #     continue
 
-                parts = [h_list_tf[i]]
+                # parts = [h_list_tf[i]]
+                parts = [h_prev[i]]
+
                 if cond_buffer.size(1) > 0:
                     parts.append(cond_buffer[:, :, i])
                 if parents[i]:
                     pv = torch.cat([cond_buffer[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
-                    x_parents_hidden_list = [h_list_tf[j] for j in parents[i]]
+                    # x_parents_hidden_list = [h_list_tf[j] for j in parents[i]]
+                    x_parents_hidden_list = [h_prev[j] for j in parents[i]]
+
                     parts.extend(x_parents_hidden_list)
 
                 cond_inv = torch.cat(parts, dim=1)
@@ -549,7 +544,7 @@ def _plot_interv_cf(
 def test_observational(
     test_ds, rnn_list, cnfs, epoch, parents,
     context_length, prediction_length, device,
-    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type="cyclic", mode="forecasting"
+    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type="chain", mode="forecasting"
 ):
     """
     Observational forecasting rollout with fan charts.
@@ -595,7 +590,7 @@ def test_observational(
 def test_interv_cf(
     test_ds, rnn_list, cnfs, epoch, parents,
     context_length, prediction_length, device,
-    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type='cyclic', mode="counterfactual"
+    K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type='chain', mode="counterfactual"
 ):
     """
     Interventional / Counterfactual rollout with fan charts.
@@ -781,7 +776,7 @@ def main_test(
         torch.cuda.empty_cache()
 
 # =========================
-# Training (simplified to always-mean-scaled)
+# Training
 # =========================
 
 if __name__ == "__main__":
@@ -789,10 +784,11 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # Type = "balanced_tail_linear_complicated"
-    Type = "two_layer_feed_forward_nonlinear"
-    # Type = "diamond_3"
-    # Type = "cyclic_linear_high_dimension"
+    # Type = "tree_linear"
+    # Type = "layer_nonlinear"
+    # Type = "diamond_linear"
+    # Type = "chain_linear"
+    Type = "chain_nonlinear"
 
     path = f'data/simulated_data/simulated_timeseries_{Type}.csv'
     df = pd.read_csv(path)
@@ -811,20 +807,18 @@ if __name__ == "__main__":
     print(f"Training series: {len(train_ds)}")
     print(f"Testing  series: {len(test_ds)}")
 
-    if Type == "cyclic":
-        parents = {0:[], 1:[0], 2:[1]}
-    elif Type == "cyclic_linear_high_dimension":
+    if Type == "chain_linear" or Type == "chain_nonlinear":
         parents = {i: ([] if i == 0 else ([0] if i == 1 else [0, i-1])) for i in range(50)}
-    elif Type == "balanced_tail" or Type.startswith("balanced_tail_linear"):
+    elif Type == "tree_linear" or Type.startswith("tree_linear"):
         parents = {0: [], 1:[0], 2:[0], 3:[1], 4:[1], 5:[2], 6:[2], 7:[6]}
-    elif Type in ["diamond", "diamond_2", "diamond_3", "diamond_2_square", "diamond_3_non_additive"]:
+    elif Type == "diamond_linear":
         parents = {0: [], 1:[0], 2:[0], 3:[1], 4:[2], 5:[1], 6:[2], 7:[3,5], 8:[4,6], 9:[7,8]}
-    elif Type in ["two_layer_feed_forward", "two_layer_feed_forward_2", "two_layer_feed_forward_nonlinear"] or Type.startswith("two_layer_feed_forward_non_additive"):
+    elif Type == "layer_nonlinear":
         parents = {0: [], 1:[], 2:[], 3:[0,1,2], 4:[0,1,2], 5:[0,1,2], 6:[0,1,2], 7:[3,4,5,6], 8:[3,4,5,6], 9:[3,4,5,6]}
 
     use_parents = True
     D = len(parents)
-    K = 10 # number of previous time steps to use as conditioning
+    K = 10 # number of previous time-steps values to use as conditioning
     hidden_size = 15
     TF = 0  # no explicit time features in data tensors now
 
@@ -854,30 +848,30 @@ if __name__ == "__main__":
     os.makedirs(save_dir, exist_ok=True)
     N_epochs = 10
 
-    if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
-        print(f"Models already exist. Loading models from {save_dir}")
-        for i, rn in enumerate(rnn_list):
-            rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
-            rn.eval()
-        for i, cnf in enumerate(cnfs):
-            cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
-            cnf.eval()
-        # print("Running test on observational forecasting...")
-        output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-        # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        # )
+    # if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
+    #     print(f"Models already exist. Loading models from {save_dir}")
+    #     for i, rn in enumerate(rnn_list):
+    #         rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
+    #         rn.eval()
+    #     for i, cnf in enumerate(cnfs):
+    #         cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
+    #         cnf.eval()
+    #     print("Running test on observational forecasting...")
+    #     output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
+    #     main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     )
 
-        # print("Running test on interventional...")
-        # main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        # )
+    #     print("Running test on interventional...")
+    #     main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     )
 
-        print("Running test on counterfactual...")
-        main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-            prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-        )
-        N_epochs = 0
+    #     print("Running test on counterfactual...")
+    #     main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+    #     )
+    #     N_epochs = 0
 
 
     for epoch in range(N_epochs):
@@ -972,11 +966,14 @@ if __name__ == "__main__":
         avg = total_loss / len(train_loader)
         print(f"Epoch {epoch+1:2d}, avg flow‐matching loss {avg:.6f}")
 
-        if (epoch+1) % 10 == 0:
+        if (epoch+1) % 5 == 0:
             for i, rn in enumerate(rnn_list):
                 torch.save(rn.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_rnn_node_{i}.pth"))
             for i, cnf in enumerate(cnfs):
                 torch.save(cnf.state_dict(), os.path.join(save_dir, f"epoch_{epoch+1}_cnf_node_{i}.pth"))
+            print("########################################################")
+            print(f"## Completed training epoch {epoch+1}; Starting test ####################")
+            print("########################################################")
             print(f"Models saved under {save_dir}")
             print("Running test on observational forecasting...")
             output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"

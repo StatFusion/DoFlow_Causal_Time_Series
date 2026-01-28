@@ -26,7 +26,9 @@ main_simulation_Jan_27.py
 utils_original.py
 treatment/
 # Data
-data/
+data/LO71-All-data-2018_0101-2020_1231-processed.csv
+data/LO93-All-data-2018_0101-2020_1231-processed.csv
+data/cancer_treatment
 
 # OS/editor junk
 .DS_Store

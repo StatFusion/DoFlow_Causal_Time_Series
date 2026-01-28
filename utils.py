@@ -12,7 +12,7 @@ def simulate_future_interventional(Type, B, D, parents, prediction_length, devic
     fut_slice = ctx[:, -((15+1) + prediction_length):-(15+1), :D].clone()  # (B, T, D)
     fut_slice[:,0,0] = ctx[:, -1, 0]
     
-    if Type == 'cyclic_linear_high_dimension':
+    if Type == 'chain_linear':
         A, P, phi = 1.0, 20, 0.0
         beta = [0.2] * 50
         beta_self = [0.6]*50
@@ -38,31 +38,42 @@ def simulate_future_interventional(Type, B, D, parents, prediction_length, devic
 
         fut_slice = X
         fut = torch.cat([fut_slice, true_future[:, :, D:]], dim=2)
+    
+    elif Type == 'chain_nonlinear':
+        A, P, phi = 1.0, 20, 0.0       # amplitude, period, phase
+        beta = [0.2] * 50
+        beta_self = [0.6]*50
+        sigma = [0.2] * 50
+        U = [torch.randn(B, prediction_length, device=device) for i in range(50)]
+        X = torch.zeros(B, prediction_length, 50, device=device)
+        X1_future = ctx[:, -(15 + prediction_length):-15, 0]
+        X[:, 0, 1:] = ctx[:, -1, 1:]
+        X[:,:,0] = X1_future
+        X[:,0,0] = ctx[:, -1, 0]
 
-    elif Type == 'balanced_tail_linear_complicated':
+        for t in range(1, prediction_length):
+            prev = X[:, t-1, :]
+            for i in range(1, 50):
+                infl = beta[i-1]*prev[:, i-1] + 0.7 * prev[:, 0]
+                X[:, t, i] = (beta_self[i]*prev[:, i] + 0.5) * abs(U[i][:, t]) + infl
+
+        fut_slice = X
+        fut = torch.cat([fut_slice, true_future[:, :, D:]], dim=2)
+
+    elif Type == 'tree_linear':
         A, P, phi = 1.0, 20, 0.0
         beta_diag = [0.5, 0.4, 0.3, 0.2, 0.1, 0.2, 0.2, 0.2]            # β_ii for i=1..8
         sigma     = [0.2] * 8            # noise σ_i for i=1..8
-        if Type == 'balanced_tail_linear_beta_2':
-            beta_par = {
-                (1, 0): 0.3,  # X2 <- X1
-                (2, 0): 0.3,  # X3 <- X1
-                (3, 1): 0.3,  # X4 <- X2
-                (4, 1): 0.3,  # X5 <- X2
-                (5, 2): 0.5,  # X6 <- X3
-                (6, 2): 0.5,  # X7 <- X3
-                (7, 6): 0.5,  # X8 <- X7
-            } 
-        else:
-            beta_par = {
-                (1, 0): 0.3,  # X2 <- X1
-                (2, 0): -0.3,  # X3 <- X1
-                (3, 1): 0.3,  # X4 <- X2
-                (4, 1): -0.3,  # X5 <- X2
-                (5, 2): 0.5,  # X6 <- X3
-                (6, 2): -0.5,  # X7 <- X3
-                (7, 6): 0.5,  # X8 <- X7
-            } # 2
+
+        beta_par = {
+            (1, 0): 0.3,  # X2 <- X1
+            (2, 0): -0.3,  # X3 <- X1
+            (3, 1): 0.3,  # X4 <- X2
+            (4, 1): -0.3,  # X5 <- X2
+            (5, 2): 0.5,  # X6 <- X3
+            (6, 2): -0.5,  # X7 <- X3
+            (7, 6): 0.5,  # X8 <- X7
+        } # 2
         X = torch.zeros(B, prediction_length, 8, device=device)
         X1_future = ctx[:, -(15 + prediction_length):-15, 0]
         noise = [torch.randn(B, prediction_length, device=device) * sigma[i] for i in range(8)]
@@ -85,7 +96,7 @@ def simulate_future_interventional(Type, B, D, parents, prediction_length, devic
         fut_slice = X
         fut = torch.cat([fut_slice, true_future[:, :, D:]], dim=2)
     
-    elif Type == 'diamond_3':
+    elif Type == 'diamond_linear':
         beta_diag = [0.5, 0.4, 0.3, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2] 
         beta_par = {
             (1, 0): 0.3,  # X2 <- X1
@@ -125,7 +136,7 @@ def simulate_future_interventional(Type, B, D, parents, prediction_length, devic
         fut_slice = X
         fut = torch.cat([fut_slice, true_future[:, :, D:]], dim=2)
     
-    elif Type == 'two_layer_feed_forward_nonlinear':
+    elif Type == 'layer_nonlinear':
         phis = np.linspace(0, 2*np.pi, 10)
         As   = 0.5 + np.arange(10)*0.1
         Ps   = 15 + np.arange(10)*2
@@ -190,7 +201,7 @@ def simulate_future_counterfactual(
     X_intervention = ctx_history[:, -(15 + prediction_length):-15, inter_set]
 
     
-    if Type == "cyclic_linear_high_dimension":
+    if Type == "chain_linear":
         A, P, phi = 1.0, 20, 0.0
         beta = [0.2] * 50
         beta_self = [0.6]*50
@@ -202,9 +213,23 @@ def simulate_future_counterfactual(
                 ar = beta_self[j] * prev_val
                 infl = beta[j-1]*true_future[:, t-1, j-1] + 0.7 * true_future[:, t-1, 0]
                 noise[:, t, j] = true_future[:, t, j] - (ar + infl)
-
     
-    elif Type == "balanced_tail_linear_complicated":
+    elif Type == "chain_nonlinear":
+        beta = [0.2] * 50
+        beta_self = [0.6]*50
+        sigma = [0.2] * 50
+        
+        for t in range(H):
+            for j in range(1, D):
+                prev_val = true_future[:, t-1, j] if t>0 else ctx_history[:, -1, j]
+                if t == 0:
+                    infl = beta[j-1]*ctx_history[:, -1, j-1] + 0.7 * ctx_history[:, -1, 0]
+                else:
+                    infl = beta[j-1]*true_future[:, t-1, j-1] + 0.7 * true_future[:, t-1, 0]
+                #noise is inferred absolute noise here
+                noise[:, t, j] = (true_future[:, t, j] - infl) / (beta_self[j]*prev_val + 0.5)
+    
+    elif Type == "tree_linear":
         beta_diag = [0.5, 0.4, 0.3, 0.2, 0.1, 0.2, 0.2, 0.2]
         beta_par = {
             (1, 0): 0.3,  # X2 <- X1
@@ -227,7 +252,7 @@ def simulate_future_counterfactual(
                 noise[:, t, j] = true_future[:, t, j] - (ar + infl)
     
 
-    elif Type == "diamond_3":
+    elif Type == "diamond_linear":
         beta_diag = [0.5, 0.4, 0.3, 0.2, 0.1, 0.2, 0.2, 0.2, 0.2, 0.2]
         beta_par = {
             (1, 0): 0.3,  # X2 <- X1
@@ -254,7 +279,7 @@ def simulate_future_counterfactual(
                 )
                 noise[:, t, j] = true_future[:, t, j] - (ar + infl)
     
-    elif Type == "two_layer_feed_forward_nonlinear":
+    elif Type == "layer_nonlinear":
         phis = np.linspace(0, 2*np.pi, 10)
         As   = 0.5 + np.arange(10)*0.1
         Ps   = 15 + np.arange(10)*2
@@ -298,14 +323,21 @@ def simulate_future_counterfactual(
         else:
             prev = cf[:, t-1, :]
             
-        if Type == "cyclic_linear_high_dimension":
+        if Type == "chain_linear":
             x0 = prev[:, 0]  # (B,)
             for j in range(1, D):
                 ar = beta_self[j] * prev[:, j]
                 infl = beta[j-1] * prev[:, j-1] + 0.7 * x0
                 cf[:, t, j] = ar + infl + noise[:, t, j]
 
-        elif Type == "balanced_tail_linear_complicated":
+        elif Type == "chain_nonlinear":
+            x0 = prev[:, 0]  # (B,)
+            for j in range(1, D):
+                ar = beta_self[j] * prev[:, j]
+                infl = beta[j-1] * prev[:, j-1] + 0.7 * x0
+                cf[:, t, j] = (beta_self[j]*prev[:, j] + 0.5) * noise[:, t, j] + infl
+
+        elif Type == "tree_linear":
             for j in range(1, D):
                 ar_term = beta_diag[j] * prev[:, j]
                 infl_term = sum(
@@ -314,7 +346,7 @@ def simulate_future_counterfactual(
                 )
                 cf[:, t, j] = ar_term + infl_term + noise[:, t, j]
         
-        elif Type == "diamond_3":
+        elif Type == "diamond_linear":
             for j in range(1, D):
                 ar_term = beta_diag[j] * prev[:, j]
                 infl_term = sum(
@@ -323,7 +355,7 @@ def simulate_future_counterfactual(
                 )
                 cf[:, t, j] = ar_term + infl_term + noise[:, t, j]
         
-        elif Type == "two_layer_feed_forward_nonlinear":
+        elif Type == "layer_nonlinear":
             for j in range(3, D):
                 ar_term = beta_diag[j] * prev[:, j]
                 infl_term = sum(
