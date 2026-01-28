@@ -228,7 +228,7 @@ def _prepare_test_batch(test_ds, idxs, context_length, device):
 def _scale_context(ctx, D, scaler: MeanScaler, K: int):
     """
     Always scale; returns:
-      ctx_in: (B, ctx, D+TF),
+      ctx_in: (B, ctx, D),
       norm_ctx: (B, ctx, D),
       loc: (B,1,D), scale: (B,1,D),
       buf0: (B, K, D)
@@ -248,11 +248,11 @@ def _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0):
       hidden: list of (h_n, c_n) per node (broadcast to ensembles)
       h_list: dict node->top hidden per chain
       condition_x_last: (B*num_ens, K, D)
-      B_e: int
-      TF: int
+      num_ens: number of predictions to generate for each test time series.
+      B_e = B * num_ens
     """
     B, context_length, _ = ctx_in.shape
-    TF = ctx_in.shape[-1] - D
+    # TF = ctx_in.shape[-1] - D
 
     hidden = [None] * D
     h_list = {}
@@ -272,11 +272,15 @@ def _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0):
     buf0_e = buf0.unsqueeze(1).expand(B, num_ens, buf0.size(1), D)
     B_e = B * num_ens
     condition_x_last = buf0_e.reshape(B_e, buf0.size(1), D).clone()
-    return hidden, h_list, condition_x_last, B_e, TF
+    return hidden, h_list, condition_x_last, B_e
+
+
+def _choose_intervention_set(Type: str):
+    return [0,1,2] if (Type == "layer_nonlinear") else [0]
 
 def _rollout_observational(
     fut, parents, order, rnn_list, cnfs,
-    hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens, prediction_length
+    hidden, h_list, condition_x_last, B, B_e, D, num_ens, prediction_length
 ):
     """
     Pure sampling rollout (observational/forecasting).
@@ -318,44 +322,9 @@ def _rollout_observational(
     samples_arr = samples.reshape(prediction_length, B, num_ens, D)  # (T,B,E,D)
     return samples_arr
 
-def _plot_fan_charts_observational(
-    samples_arr, q_inv, ctx, ctx_raw, loc, scale,
-    context_length, prediction_length, fut, D, output_dir, idxs, num_ens, mode="forecasting"
-):
-    B = samples_arr.shape[1]
-    random_chain = np.random.randint(num_ens, size=B)
-    for b in range(min(10, B)):
-        rows = 2 if D <= 8 else (D + 4) // 5
-        cols = 4 if D <= 8 else 5
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
-        axes = axes.flatten()
-
-        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
-        true_b = fut[b, :, :D].cpu().numpy()
-
-        t_ctx = np.arange(context_length - context_length//4, context_length)
-        t_pred = np.arange(context_length, context_length+prediction_length)
-
-        for i in range(D):
-            ax = axes[i]
-            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="context")
-            ax.plot(t_pred, true_b[:, i], label="true")
-            ax.fill_between(t_pred, q_inv[5][:, b, i],  q_inv[95][:, b, i], alpha=0.15, label="90% CI")
-            ax.fill_between(t_pred, q_inv[25][:, b, i], q_inv[75][:, b, i], alpha=0.3,  label="50% CI")
-            ax.legend(fontsize="small")
-        for j in range(D, len(axes)):
-            axes[j].axis("off")
-
-        os.makedirs(output_dir, exist_ok=True)
-        # np.save(os.path.join(output_dir, f"samples_arr_{mode}.npy"), samples_arr)
-        fig.savefig(os.path.join(output_dir, f"observational_plot_idx_{idxs[b]}.png"))
-        plt.close(fig)
-
-def _choose_intervention_set(Type: str):
-    return [0,1,2] if (Type == "layer_nonlinear") else [0]
 
 def _counterfactual_forward_pass(
-    mode, prediction_length, true_future, D, TF, B, num_ens,
+    mode, prediction_length, true_future, D, B, num_ens,
     rnn_list, cnfs, parents, order,
     hidden, h_list, condition_x_last, loc, scale
 ):
@@ -410,9 +379,19 @@ def _counterfactual_forward_pass(
 
 def _rollout_interv_cf(
     fut, mode, inter_set, parents, order, rnn_list, cnfs,
-    hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens,
+    hidden, h_list, condition_x_last, B, B_e, D, num_ens,
     prediction_length, z_all, loc, scale
 ):
+    """
+    Interventional / Counterfactual rollout prediction.
+
+    fut: the simulated true future interventional/counterfactual values.
+         Used to intervene the root nodes with the simulated true values.
+    B: batch size
+    num_ens: number of predictions to generate for each test time series.
+    B_e = B * num_ens
+    hidden, h_list: the LSTM hidden states that summarize the Context histories before the forecasting window
+    """
     all_ens = []
 
     with torch.no_grad():
@@ -423,7 +402,7 @@ def _rollout_interv_cf(
             # prediction proceeds in topological order (parents first; children last)
             for i in order:
                 if i in inter_set:
-                    # Intervening the root nodes with the simulated true values
+                    ### Intervening the root nodes with the simulated true values
                     true_vals_raw = fut[:, t, i]
                     true_vals_norm = (true_vals_raw - loc[:,0,i]) / scale[:,0,i]
                     
@@ -441,19 +420,23 @@ def _rollout_interv_cf(
                     hidden[i]  = hid
                     continue
 
-                # Predict the non-intervened (non-root) nodes
-                parts = [h_list[i]] # h_list contains the hidden states of the previous timestep
+                #### Predict the non-intervened (non-root) nodes
+                # condition_x_last: the last K values of the nodes' predicted past, i.e., \hat{X}_{t-K:t-1}
+                # h_list: the LSTM hidden states that summarize the histories up to t-1
+                parts = [h_list[i]]
                 if condition_x_last.size(1) > 0:
                     parts.append(condition_x_last[:, :, i]) # condition includes the node's past K values
                 if parents[i]:
                     # condition includes its parents' last-step values
                     pv = torch.cat([condition_x_last[:, -1, p].unsqueeze(1) for p in parents[i]], dim=1)
                     parts.append(pv)
+                    # condition includes its parents' last-step hidden states
                     x_parents_hidden_list = [h_list[j] for j in parents[i]]
                     parts.extend(x_parents_hidden_list)
 
                 cond_i = torch.cat(parts, dim=1)
                 if mode == "interventional":
+                    # By default, density = False; sampling time would be much longer if set density = True
                     x_i, logp_i = cnfs[i].sample(cond_i, density=False)
                 else:
                     z0 = z_all[i][t]
@@ -477,64 +460,6 @@ def _rollout_interv_cf(
     samples_arr = samples.reshape(prediction_length, B, num_ens, D)
     return samples_arr
 
-def _plot_interv_cf(
-    samples_arr, q_dict, ctx_raw, loc, scale,
-    context_length, prediction_length, fut, true_future,
-    D, output_dir, idxs, inter_set, mode, epoch=None
-):
-    B = samples_arr.shape[1]
-    mean_samples = samples_arr.mean(axis=2)
-    loc_np   = loc.cpu().numpy().squeeze(1)
-    scale_np = scale.cpu().numpy().squeeze(1)
-
-    for b in range(min(5, len(idxs))):
-        rows = 2 if D <= 8 else (D + 4) // 5
-        cols = 4 if D <= 8 else 5
-        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
-        fig.suptitle('Interventional Forecasting' if mode == "interventional" else 'Counterfactual Forecasting',
-                     fontsize=23, weight='bold')
-        axes = axes.flatten()
-
-        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
-        true_b = fut[b, :, :D].cpu().numpy()     # simulated target (int./cf baseline)
-
-        true_future_b = true_future[b, :, :D].cpu().numpy()
-
-        t_ctx = np.arange(context_length - context_length//4, context_length)
-        t_pred = np.arange(context_length, context_length+prediction_length)
-
-        for i in range(D):
-            ax = axes[i]
-            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="Context")
-            ax.plot(t_pred, true_b[:, i], label=("Conducted Int." if i in inter_set else ("Int. Future" if mode=="interventional" else "CF. Future")), color="orange")
-            ax.plot(t_pred, true_future_b[:, i], label="Obs. Future", linestyle=':', linewidth=0.9, color='gray', alpha=0.8)
-
-            if mode == "counterfactual" and i not in inter_set:
-                sample_chain = samples_arr[:, b, 0, i] * scale_np[b, i] + loc_np[b, i]
-                ax.plot(t_pred, sample_chain, label="Est. CF.", color="mediumseagreen")
-
-            if i >= len(inter_set) and mode == "interventional":
-                ax.fill_between(t_pred, q_dict[5][:, b, i],  q_dict[95][:, b, i], alpha=0.15, label="Est. Int. 90% CI")
-                ax.fill_between(t_pred, q_dict[25][:, b, i], q_dict[75][:, b, i], alpha=0.3,  label="Est. Int. 50% CI")
-
-            ax.axvline(context_length, ls="--", color="k", lw=1, alpha=0.7, label=("Int. start" if mode=="interventional" and i==0 else ("CF. start" if mode!="interventional" and i==0 else None)))
-            ax.set_title(rf"$X_{{{i+1},t}} (Intervened)$" if i < len(inter_set) else rf"$X_{{{i+1},t}}$", fontsize=22)
-
-            if i == 0 or i == D//2:
-                ax.legend(fontsize=12.5, loc="lower left", framealpha=0.7)
-            else:
-                ax.legend().set_visible(False)
-            ax.tick_params(axis='both', which='major', labelsize=10.5)
-
-        for j in range(D, len(axes)):
-            axes[j].axis("off")
-
-        os.makedirs(output_dir, exist_ok=True)
-        save_path = os.path.join(output_dir, f"epoch_{epoch}_interv_plot_idx_{idxs[b]}.png" if mode == "interventional" else f"epoch_{epoch}_cf_plot_idx_{idxs[b]}.png")
-        pdf_save_path = save_path.replace(".png", ".pdf")
-        fig.savefig(pdf_save_path, bbox_inches="tight")
-        fig.savefig(save_path, bbox_inches="tight")
-        plt.close(fig)
 
 
 # =========================
@@ -566,13 +491,13 @@ def test_observational(
     ctx_in, norm_ctx, loc, scale, buf0 = _scale_context(ctx, D, scaler, K)
 
     # init
-    hidden, h_list, condition_x_last, B_e, TF = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
+    hidden, h_list, condition_x_last, B_e = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
 
     # rollout
     t0 = time.time()
     samples_arr = _rollout_observational(fut, parents, order, rnn_list, cnfs,
                                          hidden, h_list, condition_x_last,
-                                         B, B_e, D, TF, num_ens, prediction_length)
+                                         B, B_e, D, num_ens, prediction_length)
     print(f"Time taken: {time.time() - t0} seconds")
 
     _, _, _, q5, q10, q25, q50, q75, q90, q95 = quantiles_and_logp(
@@ -593,7 +518,7 @@ def test_interv_cf(
     K, output_dir, num_ens=1, scaler=None, use_parents=True, stride=1, Type='chain', mode="counterfactual"
 ):
     """
-    Interventional / Counterfactual rollout with fan charts.
+    num_ens: number of predictions to generate for each test series. (The flow can generate multiple samples for each series.)
     """
     for rn in rnn_list: rn.eval()
     for cnf in cnfs: cnf.eval()
@@ -610,6 +535,8 @@ def test_interv_cf(
     ctx_in, norm_ctx, loc, scale, buf0 = _scale_context(ctx, D, scaler, K)
 
     true_future = fut_obs.clone()
+
+    #### Simulate the true future interventional/counterfactual values
     if mode == "interventional":
         fut = simulate_future_interventional(Type, B, D, parents, prediction_length, device, ctx, true_future).to(device) # unscaled future
     elif mode == "counterfactual":
@@ -617,28 +544,56 @@ def test_interv_cf(
     else:
         raise ValueError("mode must be 'interventional' or 'counterfactual'")
 
-    hidden, h_list, condition_x_last, B_e, TF = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
+    hidden, h_list, condition_x_last, B_e = _init_node_rnns(rnn_list, ctx_in, D, num_ens, K, buf0)
     if mode == "counterfactual":
         _, _, _, z_all = _counterfactual_forward_pass(
-            mode, prediction_length, true_future, D, TF, B, num_ens,
+            mode, prediction_length, true_future, D, B, num_ens,
             rnn_list, cnfs, parents, order, hidden, h_list, condition_x_last, loc, scale
         )
     else:
         z_all = None
 
+    #### Run rollout prediction over the forecasting window
+    # samples_arr: predicted future interventional/counterfactual values
     samples_arr = _rollout_interv_cf(
         fut, mode, inter_set, parents, order, rnn_list, cnfs,
-        hidden, h_list, condition_x_last, B, B_e, D, TF, num_ens,
+        hidden, h_list, condition_x_last, B, B_e, D, num_ens,
         prediction_length, z_all,
         loc, scale
     )
-
-
+    
     _, _, _, q5, q10, q25, q50, q75, q90, q95 = quantiles_and_logp(
         None, samples_arr, device, loc, scale
     )
     q_dict = {5:q5.cpu().numpy(), 10:q10.cpu().numpy(), 25:q25.cpu().numpy(), 50:q50.cpu().numpy(), 75:q75.cpu().numpy(), 90:q90.cpu().numpy(), 95:q95.cpu().numpy()}
     metrics(fut, samples_arr, device, loc, scale, output_dir, mode)
+
+
+
+    os.makedirs(output_dir, exist_ok=True)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_samples_arr.npy"), samples_arr)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_idxs.npy"), np.array(idxs, dtype=np.int64))
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_norm_ctx.npy"), norm_ctx.detach().cpu().numpy())   # (B,ctx,D)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_loc.npy"),      loc.detach().cpu().numpy())        # (B,1,D)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_scale.npy"),    scale.detach().cpu().numpy())      # (B,1,D)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_true_future.npy"), true_future.detach().cpu().numpy())  # (B,pred,D)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_fut.npy"),         fut.detach().cpu().numpy())          # (B,pred,D)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_inter_set.npy"), np.array(inter_set, dtype=np.int64))
+    meta = {
+        "mode": mode,
+        "Type": Type,
+        "context_length": context_length,
+        "prediction_length": prediction_length,
+        "K": K,
+        "num_ens": num_ens,
+        "D": D,
+        "B": B,
+    }
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_meta.npy"), meta, allow_pickle=True)
+    np.save(os.path.join(output_dir, f"epoch_{epoch}_q_dict.npy"), q_dict, allow_pickle=True)
+
+
+
 
     _plot_interv_cf(samples_arr, q_dict, norm_ctx, loc, scale,
              context_length, prediction_length, fut, true_future,
@@ -667,12 +622,6 @@ def main_test(
       - reconstructs models (RNNs + CNFs) and loads checkpoints
       - dispatches to forecasting or interventional/counterfactual testing
       - writes plots/metrics to output_dir
-
-    Assumes helper fns/classes in this file are available:
-      SimulatedDataset, MeanScaler, RNN, CNF,
-      test_observational, test_interv_cf, topo_sort, etc.
-    Also assumes quantiles_and_logp, metrics, and simulate_future_* are importable
-    if your test_* functions call them.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -700,10 +649,9 @@ def main_test(
     test_ds  = SimulatedDataset(test_df, context_length, prediction_length, device, stride=stride)
 
     D  = len(parents)
-    TF = 0
 
     rnn_list = torch.nn.ModuleList(
-        [RNN(time_feat_dim=TF, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)]
+        [RNN(time_feat_dim=0, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)]
     )
     for i, rn in enumerate(rnn_list):
         pattern = os.path.join(save_dir, f"epoch_{epoch}_rnn_node_{i}.pth")
@@ -775,6 +723,101 @@ def main_test(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+
+def _plot_fan_charts_observational(
+    samples_arr, q_inv, ctx, ctx_raw, loc, scale,
+    context_length, prediction_length, fut, D, output_dir, idxs, num_ens, mode="forecasting"
+):
+    B = samples_arr.shape[1]
+    random_chain = np.random.randint(num_ens, size=B)
+    for b in range(min(10, B)):
+        rows = 2 if D <= 8 else (D + 4) // 5
+        cols = 4 if D <= 8 else 5
+        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
+        axes = axes.flatten()
+
+        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
+        true_b = fut[b, :, :D].cpu().numpy()
+
+        t_ctx = np.arange(context_length - context_length//4, context_length)
+        t_pred = np.arange(context_length, context_length+prediction_length)
+
+        for i in range(D):
+            ax = axes[i]
+            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="context")
+            ax.plot(t_pred, true_b[:, i], label="true")
+            ax.fill_between(t_pred, q_inv[5][:, b, i],  q_inv[95][:, b, i], alpha=0.15, label="90% CI")
+            ax.fill_between(t_pred, q_inv[25][:, b, i], q_inv[75][:, b, i], alpha=0.3,  label="50% CI")
+            ax.legend(fontsize="small")
+        for j in range(D, len(axes)):
+            axes[j].axis("off")
+
+        os.makedirs(output_dir, exist_ok=True)
+        # np.save(os.path.join(output_dir, f"samples_arr_{mode}.npy"), samples_arr)
+        fig.savefig(os.path.join(output_dir, f"observational_plot_idx_{idxs[b]}.png"))
+        plt.close(fig)
+
+
+def _plot_interv_cf(
+    samples_arr, q_dict, ctx_raw, loc, scale,
+    context_length, prediction_length, fut, true_future,
+    D, output_dir, idxs, inter_set, mode, epoch=None
+):
+    B = samples_arr.shape[1]
+    mean_samples = samples_arr.mean(axis=2)
+    loc_np   = loc.cpu().numpy().squeeze(1)
+    scale_np = scale.cpu().numpy().squeeze(1)
+
+    for b in range(min(5, len(idxs))):
+        rows = 2 if D <= 8 else (D + 4) // 5
+        cols = 4 if D <= 8 else 5
+        fig, axes = plt.subplots(rows, cols, figsize=(cols*4, rows*4))
+        fig.suptitle('Interventional Forecasting' if mode == "interventional" else 'Counterfactual Forecasting',
+                     fontsize=23, weight='bold')
+        axes = axes.flatten()
+
+        ctx_b = (ctx_raw[b] * scale[b] + loc[b]).cpu().numpy()
+        true_b = fut[b, :, :D].cpu().numpy()     # simulated target (int./cf baseline)
+
+        true_future_b = true_future[b, :, :D].cpu().numpy()
+
+        t_ctx = np.arange(context_length - context_length//4, context_length)
+        t_pred = np.arange(context_length, context_length+prediction_length)
+
+        for i in range(D):
+            ax = axes[i]
+            ax.plot(t_ctx, ctx_b[-(context_length//4):, i], label="Context")
+            ax.plot(t_pred, true_b[:, i], label=("Conducted Int." if i in inter_set else ("Int. Future" if mode=="interventional" else "CF. Future")), color="orange")
+            ax.plot(t_pred, true_future_b[:, i], label="Obs. Future", linestyle=':', linewidth=0.9, color='gray', alpha=0.8)
+
+            if mode == "counterfactual" and i not in inter_set:
+                sample_chain = samples_arr[:, b, 0, i] * scale_np[b, i] + loc_np[b, i]
+                ax.plot(t_pred, sample_chain, label="Est. CF.", color="mediumseagreen")
+
+            if i >= len(inter_set) and mode == "interventional":
+                ax.fill_between(t_pred, q_dict[5][:, b, i],  q_dict[95][:, b, i], alpha=0.15, label="Est. Int. 90% CI")
+                ax.fill_between(t_pred, q_dict[25][:, b, i], q_dict[75][:, b, i], alpha=0.3,  label="Est. Int. 50% CI")
+
+            ax.axvline(context_length, ls="--", color="k", lw=1, alpha=0.7, label=("Int. start" if mode=="interventional" and i==0 else ("CF. start" if mode!="interventional" and i==0 else None)))
+            ax.set_title(rf"$X_{{{i+1},t}} (Intervened)$" if i < len(inter_set) else rf"$X_{{{i+1},t}}$", fontsize=22)
+
+            if i == 0 or i == D//2:
+                ax.legend(fontsize=12.5, loc="lower left", framealpha=0.7)
+            else:
+                ax.legend().set_visible(False)
+            ax.tick_params(axis='both', which='major', labelsize=10.5)
+
+        for j in range(D, len(axes)):
+            axes[j].axis("off")
+
+        os.makedirs(output_dir, exist_ok=True)
+        save_path = os.path.join(output_dir, f"epoch_{epoch}_interv_plot_idx_{idxs[b]}.png" if mode == "interventional" else f"epoch_{epoch}_cf_plot_idx_{idxs[b]}.png")
+        pdf_save_path = save_path.replace(".png", ".pdf")
+        fig.savefig(pdf_save_path, bbox_inches="tight")
+        fig.savefig(save_path, bbox_inches="tight")
+        plt.close(fig)
+
+
 # =========================
 # Training
 # =========================
@@ -820,9 +863,8 @@ if __name__ == "__main__":
     D = len(parents)
     K = 10 # number of previous time-steps values to use as conditioning
     hidden_size = 15
-    TF = 0  # no explicit time features in data tensors now
 
-    rnn_list = nn.ModuleList([RNN(time_feat_dim=TF, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)])
+    rnn_list = nn.ModuleList([RNN(time_feat_dim=0, num_layers=3, hidden_size=hidden_size).to(device) for _ in range(D)])
     
     cnfs = []
     cnf_layers = 3
@@ -846,32 +888,32 @@ if __name__ == "__main__":
     #########################################################
     save_dir = f"simulation/trained_model_simulation/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
     os.makedirs(save_dir, exist_ok=True)
-    N_epochs = 10
+    N_epochs = 5
 
-    # if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
-    #     print(f"Models already exist. Loading models from {save_dir}")
-    #     for i, rn in enumerate(rnn_list):
-    #         rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
-    #         rn.eval()
-    #     for i, cnf in enumerate(cnfs):
-    #         cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
-    #         cnf.eval()
-    #     print("Running test on observational forecasting...")
-    #     output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
-    #     main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     )
+    if os.path.exists(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_0.pth")):
+        print(f"Models already exist. Loading models from {save_dir}")
+        for i, rn in enumerate(rnn_list):
+            rn.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_rnn_node_{i}.pth"), map_location=device))
+            rn.eval()
+        for i, cnf in enumerate(cnfs):
+            cnf.load_state_dict(torch.load(os.path.join(save_dir, f"epoch_{N_epochs}_cnf_node_{i}.pth"), map_location=device))
+            cnf.eval()
+        # print("Running test on observational forecasting...")
+        output_dir = f"simulation/results/{Type}_hidden_par_context_{context_length}_prediction_{prediction_length}"
+        # main_test(Type=Type, mode="forecasting", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        # )
 
-    #     print("Running test on interventional...")
-    #     main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     )
+        # print("Running test on interventional...")
+        # main_test(Type=Type, mode="interventional", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+        #     prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        # )
 
-    #     print("Running test on counterfactual...")
-    #     main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
-    #         prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
-    #     )
-    #     N_epochs = 0
+        print("Running test on counterfactual...")
+        main_test(Type=Type, mode="counterfactual", parents=parents, data_path=path, save_dir=save_dir, output_dir=output_dir, context_length=context_length,
+            prediction_length=prediction_length, stride=stride, K=K, hidden_size=hidden_size, epoch=N_epochs, num_ens=30, use_parents=use_parents, device=device
+        )
+        N_epochs = 0
 
 
     for epoch in range(N_epochs):
@@ -882,7 +924,7 @@ if __name__ == "__main__":
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}", leave=False)
 
         for X in loop:
-            X = X.to(device)                       # (batch, ctx+pred, D+TF)
+            X = X.to(device)                       # (batch, ctx+pred, D)
             B = X.size(0)
             ctx = X[:, :context_length, :]
             fut = X[:, context_length:, :]
