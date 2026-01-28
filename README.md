@@ -69,7 +69,7 @@ If you find this code or paper useful for your research, please cite our work:
 ```bash
 @inproceedings{wu2026doflow,
   title={DoFlow: Flow-based Generative Models for Interventional and Counterfactual Forecasting on Time Series},
-  author={Wu, Dongze and Xie, Yao},
+  author={Wu, Dongze and Qiu, Feng and Xie, Yao},
   booktitle={International Conference on Learning Representations},
   year={2026}
 }
