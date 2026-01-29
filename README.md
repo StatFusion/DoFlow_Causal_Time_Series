@@ -7,7 +7,9 @@ This repository contains the official implementation of the paper **"DoFlow: Flo
 **DoFlow** is a flow-based generative framework capable of unified **observational**, **interventional**, and **counterfactual** forecasting on time series data. By modeling the temporal dynamics of causal DAGs, DoFlow enables researchers to answer **"what-if"** questions for complex dynamical systems.
 
 ## Simulated Data
-We simulated data that follows four causal DAG structures, including both linear-additive and non-linear-non-additive structures. The datasets are provided. Below is an example of counterfactual inference on a chain DAG structure (depicted in Fig. 7 of the paper):
+We simulated data that follows four causal DAG structures, including both linear-additive and non-linear-non-additive structures. The datasets are provided. 
+
+**An example** of counterfactual inference on a chain DAG structure (depicted in Fig. 7 of the paper):
 
 <p align="center">
   <img src="chain_nonlinear_counterfactual_plot_idx_364.png" width="720" alt="Chain (nonlinear) counterfactual forecasting example"/>
